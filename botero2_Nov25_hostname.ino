@@ -14,10 +14,10 @@
     #define mqtt_server "192.168.1.252"
     #define mqtt_port 1883
     #define mqtt_topic "micronova"
-    #define mqtt_user "mqtt"
-    #define mqtt_pass "mqtt"
-    #define ssid "domopoui"
-    #define password "0645349586"
+    #define mqtt_user "TODEFINE"
+    #define mqtt_pass "TODEFINE"
+    #define ssid "TODEFINE"
+    #define password "TODEFINE"
     
 //ESP Pinout configuration
     SoftwareSerial StoveSerial;
