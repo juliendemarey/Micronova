@@ -9,15 +9,16 @@
     #include <ArduinoOTA.h>
     #include <ESP8266HTTPUpdateServer.h>
 
+//Identifiants prives (Wi-Fi, MQTT, OTA) : voir secrets.example.h
+    #include "secrets.h"
+
+//Version du firmware (a incrementer a chaque nouvelle version)
+    #define FW_VERSION "0.6"
+
 
 //MQTT Variables
-    #define mqtt_server "192.168.1.252"
     #define mqtt_port 1883
     #define mqtt_topic "micronova"
-    #define mqtt_user "TODEFINE"
-    #define mqtt_pass "TODEFINE"
-    #define ssid "TODEFINE"
-    #define password "TODEFINE"
     
 //ESP Pinout configuration
     SoftwareSerial StoveSerial;
@@ -44,8 +45,6 @@ bool hauteur_set = false;        // indique si modifiée via web
     String espHostname = DEFAULT_HOSTNAME;
 
 //Mise a jour OTA (identifiants a changer !)
-    #define ota_user "admin"
-    #define ota_pass "ChangeMoi"
 
 //Un hostname valide : 1 a 32 caracteres, lettres/chiffres/tirets, sans tiret au debut ou a la fin
 bool isValidHostname(const String &name)
@@ -126,7 +125,7 @@ float lastQte = -1; // Variable globale pour mémoriser la dernière valeur publ
     #define settemp_topic mqtt_topic "/settemp"
     #define log_topic mqtt_topic "/log"
     #define hauteur_topic mqtt_topic "/hauteur"
-    #define device_information "{\"manufacturer\": \"Philibert Cheminot\",\"identifiers\": [\"42396f39-80d2-493b-8e8e-31a70e700bc6\"],\"model\": \"Micronova Controller\",\"name\": \"Micronova Controller\",\"sw_version\": \"1.0.0.0\"}"
+    #define device_information "{\"manufacturer\": \"Philibert Cheminot\",\"identifiers\": [\"42396f39-80d2-493b-8e8e-31a70e700bc6\"],\"model\": \"Micronova Controller\",\"name\": \"Micronova Controller\",\"sw_version\": \"" FW_VERSION "\"}"
 
 
 //State :0 - Arrêt, 1 - Ventilation Initiale, 2 - Préchauffage Resistance, 3 - Préchargement Pellet, 4 - Attente Flamme, 5 - Attente Allumage, 6 - Allumage, 7 - Travail / Chauffage, 8 - Nettoyage creuset, 9 - Nettoyage Final, 10 - Attente Standby, 11 - Standby, 12 - Alarme pellets, 13 - Alarme(to be investigated)
@@ -252,7 +251,7 @@ float lastQte = -1; // Variable globale pour mémoriser la dernière valeur publ
             //String number_payload = "{\"name\": \"Temperature\", \"command_topic\": \"" cmd_topic "\", \"state_topic\": \"" settemp_topic "\", \"min\": 15, \"max\": 25, \"step\": 0.5, \"unit_of_measurement\": \"°C\", \"retain\": false, \"optimistic\": false, \"qos\": 0, \"icon\": \"mdi:thermometer\",  \"payload_template\": \"T{{ (value * 2) | int }}\", \"unique_id\": \"d5668e9c-153c-4330-ff53-a5bdfffa4413\", \"device\": " device_information "}";
 
             String select_topic = "homeassistant/select/micronova/Controller/config";
-            String select_payload = "{\"name\": \"Temperature\", \"command_topic\": \"" cmd_topic "\", \"state_topic\": \"" settemp_topic "\",\"options\":[\"17\",\"18\",\"19\",\"20\",\"21\"],\"retain\": false, \"optimistic\": false, \"qos\": 0, \"icon\": \"mdi:thermometer\",  \"command_template\": \"T{{ (value | float) * 2 |int }}\", \"unique_id\": \"d5668e9c-153c-4330-ff53-a5bdfffa4413\", \"device\": " device_information "}";            
+            String select_payload = "{\"name\": \"Temperature\", \"command_topic\": \"" cmd_topic "\", \"state_topic\": \"" settemp_topic "\",\"options\":[\"17\",\"17.5\",\"18\",\"18.5\",\"19\",\"19.5\",\"20\",\"20.5\",\"21\"],\"retain\": false, \"optimistic\": false, \"qos\": 0, \"icon\": \"mdi:thermometer\",  \"command_template\": \"T{{ ((value | float) * 2) | int }}\", \"unique_id\": \"d5668e9c-153c-4330-ff53-a5bdfffa4413\", \"device\": " device_information "}";            
             client.publish(select_topic.c_str(), select_payload.c_str(), true);
             client.loop();  
             delay(150);            
@@ -613,6 +612,13 @@ void checkStoveReply()
             Write_Log(client,"checkStoveReply : Consigne Temperature : " + String(tempSet));
 			consigne=String(tempSet/2.0);
             client.publish(tempset_topic, String(tempSet / 2.0).c_str(), true);
+
+            // Etat du select HA : doit correspondre exactement a une option ("19" ou "19.5")
+            {
+                int raw = (int)tempSet;   // valeur stockee par le poele = consigne x 2
+                String selState = String(raw / 2) + ((raw % 2) ? ".5" : "");
+                client.publish(settemp_topic, selState.c_str(), true);
+            }
             break;
 			
     	case pwrSetAddr + _EEPROMR:
@@ -1030,6 +1036,7 @@ String htmlPage()
 	page += "<p>Consigne : <b>" + String(consigne) + " C</b></p>";
 	page += "<p>Temperature : <b>" + String(temperature) + " C</b></p>";
 	page += "<p>Etat du poele : <b>" + String(stove_state) + "</b></p>";
+    page += "<p>Version : <b>" FW_VERSION "</b> <small>(" __DATE__ " " __TIME__ ")</small></p>";
     page += "<p>Hostname : <b>" + espHostname + "</b></p>";	
     page += "</div>";
 	
@@ -1203,6 +1210,7 @@ void setup()
 
     //Write logs
     
+    Write_Log(client,"Setup : Version " FW_VERSION " (" __DATE__ " " __TIME__ ")");
     Write_Log(client,"Setup : Wifi ok");        
     Write_Log(client,"Setup : MQTT ok");        
     
