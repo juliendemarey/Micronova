@@ -1,0 +1,11 @@
+# Identifiants prives
+secrets.h
+
+# Fichiers de compilation
+build/
+*.bin
+*.elf
+
+# Divers
+.DS_Store
+.vscode/
