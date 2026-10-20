@@ -295,6 +295,9 @@ Sans marqueur valide, ou si le contenu n'est pas un hostname correct, c'est la v
 | `handleReboot()`    | Route `POST /reboot` : redémarre l'ESP. |
 | `httpUpdater`       | Route `/update` : mise à jour du firmware depuis le navigateur, protégée par identifiant et mot de passe. |
 
+<img width="570" height="900" alt="image" src="https://github.com/user-attachments/assets/9a9f33a1-c6d5-4b87-948b-292a15e6c8a0" />
+
+
 ### Hostname
 
 | Fonction              | Usage |
