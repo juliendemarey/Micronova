@@ -297,6 +297,9 @@ Without a valid marker, or if the content is not a valid hostname, the default v
 | `handleReboot()`    | Route `POST /reboot`: restarts the ESP. |
 | `httpUpdater`       | Route `/update`: firmware update from the browser, protected by a user name and password. |
 
+<img width="570" height="900" alt="image" src="https://github.com/user-attachments/assets/646224df-453b-48f2-a0ad-2de1de22bfef" />
+
+
 ### Hostname
 
 | Function              | Usage |
