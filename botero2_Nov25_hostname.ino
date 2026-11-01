@@ -13,7 +13,7 @@
     #include "secrets.h"
 
 //Version du firmware (a incrementer a chaque nouvelle version)
-    #define FW_VERSION "0.6"
+    #define FW_VERSION "0.8"
 
 
 //MQTT Variables
@@ -101,6 +101,12 @@ int measure_sleep=0;
 String stove_state="Etat inconnu";
 float lastQte = -1; // Variable globale pour mémoriser la dernière valeur publiée
 
+//Surveillance du capteur de distance (VL53L0X) et heartbeat
+    #define VL53L0X_I2C_ADDR_DEFAULT 0x29   // adresse I2C par defaut du VL53L0X
+    bool sensorInitialized = false;         // lox.begin() a reussi
+    bool lastMeasureOk = true;              // resultat de la derniere mesure (false = valeur aberrante)
+    bool sensorOk = false;                  // etat de sante global publie vers HA
+
 
 //Mqtt Topic definitions
     #define ambtemp_topic mqtt_topic "/ambtemp"
@@ -125,6 +131,9 @@ float lastQte = -1; // Variable globale pour mémoriser la dernière valeur publ
     #define settemp_topic mqtt_topic "/settemp"
     #define log_topic mqtt_topic "/log"
     #define hauteur_topic mqtt_topic "/hauteur"
+    #define heartbeat_topic mqtt_topic "/heartbeat"          // uptime en secondes, publie toutes les 60 s (non retenu)
+    #define sensorstatus_topic mqtt_topic "/sensorstatus"    // ON = capteur de pellets OK, OFF = capteur en defaut (non retenu)
+    #define ip_topic mqtt_topic "/ip"                        // adresse IP de l'ESP, republiee toutes les 60 s (retenue : derniere IP connue)
     #define device_information "{\"manufacturer\": \"Philibert Cheminot\",\"identifiers\": [\"42396f39-80d2-493b-8e8e-31a70e700bc6\"],\"model\": \"Micronova Controller\",\"name\": \"Micronova Controller\",\"sw_version\": \"" FW_VERSION "\"}"
 
 
@@ -316,8 +325,29 @@ float lastQte = -1; // Variable globale pour mémoriser la dernière valeur publ
         String hauteur_sensor_topic = "homeassistant/sensor/Micronova/hauteur/config";
         String hauteur_sensor_payload = "{\"name\": \"log\", \"state_topic\": \"" hauteur_topic "\", \"qos\": 0, \"icon\": \"mdi:console\", \"unique_id\": \"42b3fffe-6ace-4314-a427-424cd68d2442\",\"retain\":true,\"device\": " device_information "}";      
         client.publish(hauteur_sensor_topic.c_str(), hauteur_sensor_payload.c_str(), true);
-        client.loop();  
-        delay(150);       
+        client.loop();
+        delay(150);
+
+        //Sensor Heartbeat (uptime en s) : devient indisponible dans HA si plus de message depuis 180 s
+        String hb_sensor_topic = "homeassistant/sensor/Micronova/Heartbeat/config";
+        String hb_sensor_payload = "{\"name\": \"Heartbeat\", \"state_topic\": \"" heartbeat_topic "\", \"qos\": 0, \"device_class\": \"duration\", \"unit_of_measurement\": \"s\", \"entity_category\": \"diagnostic\", \"expire_after\": 180, \"icon\": \"mdi:heart-pulse\", \"unique_id\": \"3f1c8a52-7b4e-4d19-9a60-1e2b5c7d8f01\",\"device\": " device_information "}";
+        client.publish(hb_sensor_topic.c_str(), hb_sensor_payload.c_str(), true);
+        client.loop();
+        delay(150);
+
+        //Binary sensor Capteur pellets : ON = capteur OK, OFF = defaut, indisponible = ESP injoignable
+        String ps_sensor_topic = "homeassistant/binary_sensor/Micronova/PelletSensor/config";
+        String ps_sensor_payload = "{\"name\": \"Capteur pellets\", \"state_topic\": \"" sensorstatus_topic "\", \"payload_on\": \"ON\", \"payload_off\": \"OFF\", \"qos\": 0, \"device_class\": \"connectivity\", \"expire_after\": 180, \"icon\": \"mdi:signal-distance-variant\", \"unique_id\": \"a7d94c3e-2b18-4f6a-8c05-9d1e3b4f6a02\",\"device\": " device_information "}";
+        client.publish(ps_sensor_topic.c_str(), ps_sensor_payload.c_str(), true);
+        client.loop();
+        delay(150);
+
+        //Sensor Adresse IP : derniere IP connue (message retenu, pas d'expiration)
+        String ip_sensor_topic = "homeassistant/sensor/Micronova/IP/config";
+        String ip_sensor_payload = "{\"name\": \"Adresse IP\", \"state_topic\": \"" ip_topic "\", \"qos\": 0, \"entity_category\": \"diagnostic\", \"icon\": \"mdi:ip-network\", \"unique_id\": \"c5e2b7a1-6d3f-4a98-b1c4-8e0f2a9d7b03\",\"device\": " device_information "}";
+        client.publish(ip_sensor_topic.c_str(), ip_sensor_payload.c_str(), true);
+        client.loop();
+        delay(150);
 
         Write_Log(client,"MQTT : HomeAssistant topics created.");
         }
@@ -937,6 +967,14 @@ void getPowerSet() //Get the Power setting
 
 void getQte() //Get speed vis pellet
 {
+    // Capteur absent ou non initialise : on ne tente pas de mesure
+    if (!sensorInitialized)
+    {
+        lastMeasureOk = false;
+        Write_Log(client,"getQte: capteur non initialise, mesure ignoree.");
+        return;
+    }
+
     if (measure_sleep==0)
     {
         measure_sleep++;
@@ -947,6 +985,7 @@ void getQte() //Get speed vis pellet
         if (distance>1000)
         {
             count_reboot++;
+            lastMeasureOk = false;   // valeur aberrante : capteur en defaut
             Write_Log(client,"getQte: Measure Error. NB reboots="+ String(count_reboot));        
         }
         else
@@ -955,6 +994,7 @@ void getQte() //Get speed vis pellet
             {
                 count_reboot=0;
                 
+                lastMeasureOk = true;    // mesure valide
                 Write_Log(client,"getQte: Distance "+ String(distance) + " mm.");
                 client.publish(distance_topic, String(distance).c_str(), true);
                     
@@ -993,6 +1033,50 @@ void getQte() //Get speed vis pellet
 
  
 
+//Teste la presence du capteur sur le bus I2C (detecte un fil debranche sans faire de mesure)
+bool sensorPresentI2C()
+{
+    Wire.beginTransmission(VL53L0X_I2C_ADDR_DEFAULT);
+    return (Wire.endTransmission() == 0);
+}
+
+//Met a jour l'etat de sante du capteur (appele toutes les 60 s) et tente de le reinitialiser s'il revient
+void updateSensorHealth()
+{
+    bool present = sensorPresentI2C();
+
+    if (!present)
+    {
+        if (sensorInitialized) Write_Log(client,"Sensor : VL53L0X absent du bus I2C.");
+        sensorInitialized = false;   // sera reinitialise des qu'il reapparait
+    }
+    else if (!sensorInitialized)
+    {
+        if (lox.begin())
+        {
+            sensorInitialized = true;
+            lastMeasureOk = true;
+            Write_Log(client,"Sensor : VL53L0X (re)initialise.");
+        }
+        else
+        {
+            Write_Log(client,"Sensor : VL53L0X present mais init KO.");
+        }
+    }
+
+    sensorOk = present && sensorInitialized && lastMeasureOk;
+}
+
+//Publie le heartbeat (uptime en s) et l'etat du capteur. Messages NON retenus : un message
+//retenu serait relivre a HA apres un redemarrage et ferait croire que l'ESP est vivant.
+//L'adresse IP, elle, est retenue : on veut retrouver la derniere IP connue meme si l'ESP est eteint.
+void publishHeartbeat()
+{
+    client.publish(heartbeat_topic, String(millis() / 1000UL).c_str(), false);
+    client.publish(sensorstatus_topic, sensorOk ? "ON" : "OFF", false);
+    client.publish(ip_topic, WiFi.localIP().toString().c_str(), true);
+}
+
 void getStates() //Calls all the get…() functions
 {
     getStovePower();
@@ -1004,6 +1088,18 @@ void getStates() //Calls all the get…() functions
 }
 
 //Page Web (HTML minimaliste)
+//Formate une duree en secondes : "3 j 4 h 12 min"
+String formatUptime(unsigned long totalSeconds)
+{
+    unsigned long days = totalSeconds / 86400UL;
+    unsigned long hours = (totalSeconds % 86400UL) / 3600UL;
+    unsigned long minutes = (totalSeconds % 3600UL) / 60UL;
+    String s = "";
+    if (days > 0) s += String(days) + " j ";
+    s += String(hours) + " h " + String(minutes) + " min";
+    return s;
+}
+
 String htmlPage()
 {
     String page = "<!DOCTYPE html><html><head>";
@@ -1014,6 +1110,8 @@ String htmlPage()
     page += "<style>";
     page += "body { font-family: Arial, sans-serif; background-color: #f4f4f9; color: #333; text-align: center; padding: 20px; }";
     page += "h2 { color: #2c3e50; }";
+    page += "h3 { color: #2c3e50; margin: 0 0 10px 0; }";
+    page += ".ok { color: #27ae60; } .ko { color: #e74c3c; }";
     page += "form { background: white; padding: 20px; margin: 20px auto; border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.2); max-width: 400px; }";
     page += "input[type=number], input[type=text] { width: 100%; padding: 10px; margin: 10px 0; border-radius: 5px; border: 1px solid #ccc; }";
     page += "input[type=submit] { background-color: #3498db; color: white; padding: 10px 20px; border: none; border-radius: 5px; font-size: 16px; cursor: pointer; transition: background 0.3s; }";
@@ -1037,7 +1135,20 @@ String htmlPage()
 	page += "<p>Temperature : <b>" + String(temperature) + " C</b></p>";
 	page += "<p>Etat du poele : <b>" + String(stove_state) + "</b></p>";
     page += "<p>Version : <b>" FW_VERSION "</b> <small>(" __DATE__ " " __TIME__ ")</small></p>";
-    page += "<p>Hostname : <b>" + espHostname + "</b></p>";	
+    page += "<p>Hostname : <b>" + espHostname + "</b></p>";
+    page += "</div>";
+
+    // Carte Informations systeme
+    page += "<div class='card'>";
+    page += "<h3>Informations systeme</h3>";
+    page += "<p>Uptime : <b>" + formatUptime(millis() / 1000UL) + "</b></p>";
+    page += "<p>Cause du dernier reset : <b>" + ESP.getResetReason() + "</b></p>";
+    page += "<p>Wi-Fi : <b>" + WiFi.SSID() + "</b> (" + String(WiFi.RSSI()) + " dBm)</p>";
+    page += "<p>Adresse IP : <b>" + WiFi.localIP().toString() + "</b></p>";
+    page += "<p>Adresse MAC : <b>" + WiFi.macAddress() + "</b></p>";
+    page += "<p>MQTT : <b class='" + String(client.connected() ? "ok" : "ko") + "'>" + String(client.connected() ? "Connecte" : "Deconnecte") + "</b></p>";
+    page += "<p>Capteur pellets (VL53L0X) : <b class='" + String(sensorOk ? "ok" : "ko") + "'>" + String(sensorOk ? "OK" : "En defaut") + "</b></p>";
+    page += "<p>Memoire libre : <b>" + String(ESP.getFreeHeap() / 1024.0, 1) + " ko</b> (fragmentation " + String(ESP.getHeapFragmentation()) + " %)</p>";    
     page += "</div>";
 	
 	// Formulaire pour la hauteur
@@ -1219,19 +1330,24 @@ void setup()
     
     Wire.begin(SDA, SCL);   // SDA = D6, SCL = D1
     Wire.setClock(100000);    
-    if (!lox.begin()) {
-        Write_Log(client,"Setup VL53L0X : KO");                
+    sensorInitialized = lox.begin();
+    if (!sensorInitialized) {
+        Write_Log(client,"Setup VL53L0X : KO");
     }
     else
     {
-        Write_Log(client,"Setup VL53L0X : ok");       
-    }   
+        Write_Log(client,"Setup VL53L0X : ok");
+    }
 
     count_reboot=0;
     Write_Log(client,"Setup count_reboot=0"); 
 
     measure_sleep=0;
-    Write_Log(client,"Setup MeasureSleep=0"); 
+    Write_Log(client,"Setup MeasureSleep=0");
+
+    // Premier heartbeat immediat (sans attendre 60 s)
+    updateSensorHealth();
+    publishHeartbeat();
       
 }
 
@@ -1260,6 +1376,8 @@ void loop()
     {
         previousMillis = currentMillis;
         getStates();
+        updateSensorHealth();
+        publishHeartbeat();
         client.publish(pong_topic, "Connecté");
         Write_Log(client,"Loop : Alive");        
         if (count_reboot >10)

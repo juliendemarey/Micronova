@@ -2,7 +2,7 @@
 
 > ESP8266 firmware that bridges a Micronova pellet stove and Home Assistant over MQTT: stove control, pellet hopper level measurement, MQTT autodiscovery, web configuration page and OTA updates.
 
-This document describes the firmware **version 0.7** (`botero2_Nov25_hostname.ino`).
+This document describes the firmware **version 0.8** (`botero2_Nov25_hostname.ino`).
 
 ## Table of contents
 
@@ -24,7 +24,7 @@ This firmware turns an ESP8266 into a gateway between a **pellet stove fitted wi
 - read the stove state (off, ignition, heating, alarm…), the ambient temperature, the power level and the temperature setpoint;
 - control the stove (on, off, standby, power level, temperature setpoint);
 - measure the pellet level in the hopper with a VL53L0X distance sensor;
-- tell HA that it is alive and that the pellet sensor works (MQTT heartbeat), so that a failure can be detected;
+- tell HA that it is alive and that the pellet sensor works (MQTT heartbeat), so that a failure can be detected, and report its IP address;
 - declare all its sensors and controls to HA automatically (MQTT discovery);
 - be configured and updated without a cable (web page, OTA).
 
@@ -66,7 +66,7 @@ This firmware turns an ESP8266 into a gateway between a **pellet stove fitted wi
 
 1. **Startup** (`setup`): read the hostname from EEPROM, connect to Wi-Fi, start the web server and OTA, connect to MQTT, publish the autodiscovery messages, subscribe to commands, initialize the VL53L0X sensor, publish a first heartbeat.
 2. **Loop** (`loop`), continuously: keep the MQTT connection alive, process incoming messages (commands), serve web and OTA requests.
-3. **Every 60 seconds**: poll the stove and the sensor (`getStates`), evaluate the sensor health (`updateSensorHealth`), publish the heartbeat (`publishHeartbeat`) and an alive message (`pong`). After more than 10 failed distance measurements in a row, the ESP restarts.
+3. **Every 60 seconds**: poll the stove and the sensor (`getStates`), evaluate the sensor health (`updateSensorHealth`), publish the heartbeat and the IP address (`publishHeartbeat`) and an alive message (`pong`). After more than 10 failed distance measurements in a row, the ESP restarts.
 
 ---
 
@@ -249,8 +249,11 @@ Since version 0.7, the firmware tells HA that it is alive and that the pellet se
 |--------------------------|------------------------------------------------------------|--------------|
 | `micronova/heartbeat`    | ESP uptime in seconds (`millis() / 1000`)                  | every 60 s   |
 | `micronova/sensorstatus` | `ON` if the sensor is healthy, `OFF` otherwise             | every 60 s   |
+| `micronova/ip`           | ESP IP address (for example `192.168.1.50`)                | every 60 s   |
 
-They are published **without the retain flag**: a retained message would be sent again to HA after its restart and would make it believe the ESP is alive. A first message is sent at the end of `setup()`, without waiting 60 s.
+The heartbeat and the sensor state are published **without the retain flag**: a retained message would be sent again to HA after its restart and would make it believe the ESP is alive. A first message is sent at the end of `setup()`, without waiting 60 s.
+
+The **IP address** (added in version 0.8) is the exception: it is published **with the retain flag**. This way HA keeps the last known IP of the ESP even when it is switched off or unreachable, which is exactly when you need it to troubleshoot. It is republished every 60 s cycle, so an address change (new DHCP lease) is picked up in under a minute. It has no `expire_after`: this entity never becomes "unavailable" because of this topic.
 
 The sensor state is computed by `updateSensorHealth()` every 60 s, right after `getStates()`:
 
@@ -345,7 +348,7 @@ Without a valid marker, or if the content is not a valid hostname, the default v
 |-------------------------|-------|
 | `sensorPresentI2C()`    | Queries I²C address `0x29`: returns true if the VL53L0X answers (detects a disconnected wire without taking a measurement). |
 | `updateSensorHealth()`  | Called every 60 s: tests the sensor presence, re-initializes it (`lox.begin()`) if it came back, then computes `sensorOk` (see 3.4). |
-| `publishHeartbeat()`    | Publishes the uptime on `micronova/heartbeat` and `ON` / `OFF` on `micronova/sensorstatus`, without the retain flag. |
+| `publishHeartbeat()`    | Publishes the uptime on `micronova/heartbeat` and `ON` / `OFF` on `micronova/sensorstatus`, without the retain flag, then the IP address on `micronova/ip`, with the retain flag. |
 
 ### Web page
 
@@ -427,7 +430,7 @@ Every entity carries the same device description (the `device_information` macro
   "identifiers": ["42396f39-80d2-493b-8e8e-31a70e700bc6"],
   "model": "Micronova Controller",
   "name": "Micronova Controller",
-  "sw_version": "0.7"
+  "sw_version": "0.8"
 }
 ```
 
@@ -449,6 +452,7 @@ Every entity carries the same device description (the `device_information` macro
 | `sensor`  | hauteur       | `micronova/hauteur`     | —                 | Hopper height |
 | `sensor`  | Heartbeat     | `micronova/heartbeat`   | —                 | Uptime in seconds, `device_class: duration`, diagnostic category, `expire_after` 180 s |
 | `binary_sensor` | Capteur pellets | `micronova/sensorstatus` | —          | `payload_on` = `ON`, `payload_off` = `OFF`, `device_class: connectivity`, `expire_after` 180 s |
+| `sensor`  | Adresse IP    | `micronova/ip`          | —                 | Diagnostic category, retained message, no `expire_after` |
 
 ### Anatomy of a message (example: temperature sensor)
 
@@ -488,6 +492,8 @@ homeassistant/sensor/Micronova/Heartbeat/config
 homeassistant/binary_sensor/Micronova/PelletSensor/config
 ```
 
+The **Adresse IP** entity (`homeassistant/sensor/Micronova/IP/config`) behaves differently: its state message is retained and it has no `expire_after`, so that the last known address is kept (see 3.4).
+
 ### Changing or removing an entity
 
 | Situation | What to do |
@@ -500,7 +506,7 @@ homeassistant/binary_sensor/Micronova/PelletSensor/config
 
 ## 6. Appendix: known issues
 
-These points come from reading the code. They are not fixed in version 0.7.
+These points come from reading the code. They are not fixed in version 0.8.
 
 1. **Hopper height is not kept.** `hauteur_cuve` goes back to 500 mm at every restart. The MQTT `H` command meant to restore it reads the value without assigning it, and only accepts 3-character messages.
 2. **Possible crash on `P`.** A `P` message followed by a character other than 0 to 5 leaves a null pointer (`stovePW`) that is then used for the write.

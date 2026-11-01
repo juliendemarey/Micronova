@@ -1,6 +1,6 @@
 # Contrôleur Micronova (ESP8266) — Documentation technique
 
-Document rédigé d'après le code du firmware **version 0.7** (`botero2_Nov25_hostname.ino`).
+Document rédigé d'après le code du firmware **version 0.8** (`botero2_Nov25_hostname.ino`).
 
 ## Sommaire
 
@@ -22,7 +22,7 @@ Ce firmware transforme un ESP8266 en passerelle entre un **poêle à pellets éq
 - lire l'état du poêle (arrêté, allumage, chauffage, alarme…), la température ambiante, la puissance et la consigne ;
 - commander le poêle (marche, arrêt, stand-by, puissance, consigne de température) ;
 - mesurer le niveau de pellets dans la cuve avec un capteur de distance VL53L0X ;
-- signaler à HA qu'il est en vie et que le capteur de pellets fonctionne (heartbeat MQTT), pour détecter une panne ;
+- signaler à HA qu'il est en vie et que le capteur de pellets fonctionne (heartbeat MQTT), pour détecter une panne, et lui communiquer son adresse IP ;
 - déclarer automatiquement tous les capteurs et commandes dans HA (MQTT discovery) ;
 - se configurer et se mettre à jour sans câble (page web, OTA).
 
@@ -64,7 +64,7 @@ Ce firmware transforme un ESP8266 en passerelle entre un **poêle à pellets éq
 
 1. **Démarrage** (`setup`) : lecture du hostname en EEPROM, connexion Wi-Fi, démarrage du serveur web et de l'OTA, connexion MQTT, publication de l'autodiscovery, abonnement aux commandes, initialisation du capteur VL53L0X, premier heartbeat.
 2. **Boucle** (`loop`), en continu : maintien de la connexion MQTT, traitement des messages entrants (commandes), service des requêtes web et OTA.
-3. **Toutes les 60 secondes** : interrogation du poêle et du capteur (`getStates`), évaluation de la santé du capteur (`updateSensorHealth`), publication du heartbeat (`publishHeartbeat`) et d'un message de vie (`pong`). Au bout de plus de 10 mesures de distance en échec, l'ESP redémarre.
+3. **Toutes les 60 secondes** : interrogation du poêle et du capteur (`getStates`), évaluation de la santé du capteur (`updateSensorHealth`), publication du heartbeat et de l'adresse IP (`publishHeartbeat`) et d'un message de vie (`pong`). Au bout de plus de 10 mesures de distance en échec, l'ESP redémarre.
 
 ---
 
@@ -247,8 +247,11 @@ Depuis la version 0.7, le firmware signale à HA qu'il est en vie et que le capt
 |--------------------------|-------------------------------------------------------------------|-----------------|
 | `micronova/heartbeat`    | Durée de fonctionnement de l'ESP, en secondes (`millis() / 1000`) | toutes les 60 s |
 | `micronova/sensorstatus` | `ON` si le capteur est sain, `OFF` sinon                          | toutes les 60 s |
+| `micronova/ip`           | Adresse IP de l'ESP (par exemple `192.168.1.50`)                  | toutes les 60 s |
 
-Ils sont publiés **sans l'option retenue** : un message retenu serait renvoyé à HA après son redémarrage et ferait croire que l'ESP est en vie. Un premier envoi a lieu à la fin de `setup()`, sans attendre 60 s.
+Le heartbeat et l'état du capteur sont publiés **sans l'option retenue** : un message retenu serait renvoyé à HA après son redémarrage et ferait croire que l'ESP est en vie. Un premier envoi a lieu à la fin de `setup()`, sans attendre 60 s.
+
+L'**adresse IP** (ajoutée en version 0.8) fait exception : elle est publiée **avec l'option retenue**. On veut ainsi retrouver dans HA la dernière IP connue de l'ESP même quand il est éteint ou injoignable, ce qui sert justement à le dépanner. Elle est republiée à chaque cycle de 60 s, donc un changement d'adresse (nouveau bail DHCP) est pris en compte en moins d'une minute. Elle n'a pas d'`expire_after` : l'entité ne passe jamais en « indisponible » à cause de ce topic.
 
 L'état du capteur est calculé par `updateSensorHealth()` à chaque cycle de 60 s, juste après `getStates()` :
 
@@ -343,7 +346,7 @@ Sans marqueur valide, ou si le contenu n'est pas un hostname correct, c'est la v
 |-------------------------|-------|
 | `sensorPresentI2C()`    | Interroge l'adresse I²C `0x29` : renvoie vrai si le VL53L0X répond (détecte un fil débranché sans faire de mesure). |
 | `updateSensorHealth()`  | Appelée toutes les 60 s : teste la présence du capteur, le réinitialise (`lox.begin()`) s'il est revenu, puis calcule `sensorOk` (voir 3.4). |
-| `publishHeartbeat()`    | Publie l'uptime sur `micronova/heartbeat` et `ON` / `OFF` sur `micronova/sensorstatus`, sans l'option retenue. |
+| `publishHeartbeat()`    | Publie l'uptime sur `micronova/heartbeat` et `ON` / `OFF` sur `micronova/sensorstatus`, sans l'option retenue, puis l'adresse IP sur `micronova/ip`, avec l'option retenue. |
 
 ### Page web
 
@@ -425,7 +428,7 @@ Toutes les entités embarquent la même description d'appareil (macro `device_in
   "identifiers": ["42396f39-80d2-493b-8e8e-31a70e700bc6"],
   "model": "Micronova Controller",
   "name": "Micronova Controller",
-  "sw_version": "0.7"
+  "sw_version": "0.8"
 }
 ```
 
@@ -447,6 +450,7 @@ Toutes les entités embarquent la même description d'appareil (macro `device_in
 | `sensor`  | hauteur       | `micronova/hauteur`     | —                 | Hauteur de la cuve |
 | `sensor`  | Heartbeat     | `micronova/heartbeat`   | —                 | Uptime en secondes, `device_class: duration`, catégorie diagnostic, `expire_after` 180 s |
 | `binary_sensor` | Capteur pellets | `micronova/sensorstatus` | —          | `payload_on` = `ON`, `payload_off` = `OFF`, `device_class: connectivity`, `expire_after` 180 s |
+| `sensor`  | Adresse IP    | `micronova/ip`          | —                 | Catégorie diagnostic, message retenu, pas d'`expire_after` |
 
 ### Anatomie d'un message (exemple : capteur de température)
 
@@ -486,6 +490,8 @@ homeassistant/sensor/Micronova/Heartbeat/config
 homeassistant/binary_sensor/Micronova/PelletSensor/config
 ```
 
+L'entité **Adresse IP** (`homeassistant/sensor/Micronova/IP/config`) se comporte différemment : son message d'état est retenu et elle n'a pas d'`expire_after`, de façon à conserver la dernière adresse connue (voir 3.4).
+
 ### Modifier ou supprimer une entité
 
 | Situation | Que faire |
@@ -498,7 +504,7 @@ homeassistant/binary_sensor/Micronova/PelletSensor/config
 
 ## 6. Annexe : points d'attention connus
 
-Ces points ressortent de la lecture du code. Ils ne sont pas corrigés dans la version 0.7.
+Ces points ressortent de la lecture du code. Ils ne sont pas corrigés dans la version 0.8.
 
 1. **Hauteur de cuve non conservée.** `hauteur_cuve` repart à 500 mm à chaque redémarrage. La commande MQTT `H` censée la restaurer lit la valeur sans l'affecter, et n'accepte que les messages de 3 caractères.
 2. **Plantage possible sur `P`.** Un message `P` suivi d'un caractère autre que 0 à 5 laisse un pointeur nul (`stovePW`) qui est ensuite utilisé pour l'écriture.
