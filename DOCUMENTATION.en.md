@@ -2,7 +2,7 @@
 
 > ESP8266 firmware that bridges a Micronova pellet stove and Home Assistant over MQTT: stove control, pellet hopper level measurement, MQTT autodiscovery, web configuration page and OTA updates.
 
-This document describes the firmware **version 0.6** (`botero2_Nov25_hostname.ino`).
+This document describes the firmware **version 0.7** (`botero2_Nov25_hostname.ino`).
 
 ## Table of contents
 
@@ -24,6 +24,7 @@ This firmware turns an ESP8266 into a gateway between a **pellet stove fitted wi
 - read the stove state (off, ignition, heating, alarm…), the ambient temperature, the power level and the temperature setpoint;
 - control the stove (on, off, standby, power level, temperature setpoint);
 - measure the pellet level in the hopper with a VL53L0X distance sensor;
+- tell HA that it is alive and that the pellet sensor works (MQTT heartbeat), so that a failure can be detected;
 - declare all its sensors and controls to HA automatically (MQTT discovery);
 - be configured and updated without a cable (web page, OTA).
 
@@ -63,9 +64,9 @@ This firmware turns an ESP8266 into a gateway between a **pellet stove fitted wi
 
 ### Runtime cycle
 
-1. **Startup** (`setup`): read the hostname from EEPROM, connect to Wi-Fi, start the web server and OTA, connect to MQTT, publish the autodiscovery messages, subscribe to commands, initialize the VL53L0X sensor.
+1. **Startup** (`setup`): read the hostname from EEPROM, connect to Wi-Fi, start the web server and OTA, connect to MQTT, publish the autodiscovery messages, subscribe to commands, initialize the VL53L0X sensor, publish a first heartbeat.
 2. **Loop** (`loop`), continuously: keep the MQTT connection alive, process incoming messages (commands), serve web and OTA requests.
-3. **Every 60 seconds**: poll the stove and the sensor (`getStates`), publish a heartbeat (`pong`). After more than 10 failed distance measurements in a row, the ESP restarts.
+3. **Every 60 seconds**: poll the stove and the sensor (`getStates`), evaluate the sensor health (`updateSensorHealth`), publish the heartbeat (`publishHeartbeat`) and an alive message (`pong`). After more than 10 failed distance measurements in a row, the ESP restarts.
 
 ---
 
@@ -236,10 +237,62 @@ quantity (%) = (hopper_height − distance) / hopper_height × 100
 
 - `hauteur_cuve` (hopper height) is 500 mm by default and can be set from the web page (100 to 2000 mm).
 - A measurement is only taken **every 11 cycles** (about 11 minutes), using the `measure_sleep` counter.
-- A distance above 1000 mm counts as an error (`count_reboot`). More than 10 consecutive failed measurements restart the ESP; a valid measurement resets the counter. An "out of range" sensor status (status 4) is only logged and does not count.
+- A distance above 1000 mm counts as an error (`count_reboot`) and sets `lastMeasureOk` to false. More than 10 consecutive failed measurements restart the ESP; a valid measurement resets the counter and sets `lastMeasureOk` back to true. An "out of range" sensor status (status 4) is only logged and does not count.
+- If the sensor is not initialized (missing at startup, or gone from the I²C bus), `getQte()` does not attempt any measurement: it sets `lastMeasureOk` to false, logs it and returns (see 3.4).
 - The distance is published on `micronova/distance` at every measurement. The quantity is only published on `micronova/qte` if it changed by at least 10 points since the last published value.
 
-### 3.4 Local storage (ESP EEPROM)
+### 3.4 Heartbeat and sensor health
+
+Since version 0.7, the firmware tells HA that it is alive and that the pellet sensor works. Because the quantity is only published when it changes by at least 10 points, its silence cannot be used to detect a failure: these two messages fill that gap.
+
+| Topic                    | Content                                                    | Rate         |
+|--------------------------|------------------------------------------------------------|--------------|
+| `micronova/heartbeat`    | ESP uptime in seconds (`millis() / 1000`)                  | every 60 s   |
+| `micronova/sensorstatus` | `ON` if the sensor is healthy, `OFF` otherwise             | every 60 s   |
+
+They are published **without the retain flag**: a retained message would be sent again to HA after its restart and would make it believe the ESP is alive. A first message is sent at the end of `setup()`, without waiting 60 s.
+
+The sensor state is computed by `updateSensorHealth()` every 60 s, right after `getStates()`:
+
+```
+sensorOk = sensor present on the I²C bus  AND  sensor initialized  AND  last measurement valid
+```
+
+- **Presence**: `sensorPresentI2C()` queries address `0x29` (the default VL53L0X address). A disconnected wire is therefore detected in under a minute, without taking a measurement.
+- **Initialization**: the result of `lox.begin()` is kept in `sensorInitialized`. If the sensor disappears from the bus and comes back, `updateSensorHealth()` re-initializes it automatically (previously, a failed initialization was never retried without a restart).
+- **Last measurement** (`lastMeasureOk`): becomes false on a distance above 1000 mm and true again on a valid measurement. Since a measurement is only taken every 11 cycles, an out-of-range reading can take up to 11 minutes to show up. The "out of range" status (status 4) does not change this state.
+
+On the HA side, two entities use these topics (see section 5). They have an `expire_after` of 180 s: with no message for 3 minutes, they become "unavailable".
+
+| State of the "Capteur pellets" entity | Meaning                                                      |
+|---------------------------------------|--------------------------------------------------------------|
+| `on`                                  | Everything is fine                                           |
+| `off`                                 | The ESP answers, but the sensor is faulty                    |
+| `unavailable`                         | No message for 3 minutes: ESP, Wi-Fi or MQTT is down         |
+
+Example HA automation (check the entity ids in your installation; the 3-minute delay avoids false alerts when HA restarts, as the entities are briefly unavailable):
+
+```yaml
+alias: Micronova - pellet sensor fault
+triggers:
+  - trigger: state
+    entity_id: binary_sensor.micronova_controller_capteur_pellets
+    to:
+      - "off"
+      - unavailable
+    for: "00:03:00"
+actions:
+  - action: notify.notify
+    data:
+      title: "Pellet stove"
+      message: >
+        {{ 'The Micronova controller no longer answers (ESP, Wi-Fi or MQTT).'
+           if is_state('sensor.micronova_controller_heartbeat', 'unavailable')
+           else 'The pellet level sensor is disconnected or returns out-of-range values.' }}
+mode: single
+```
+
+### 3.5 Local storage (ESP EEPROM)
 
 Only the hostname is kept in EEPROM (64 bytes reserved):
 
@@ -259,8 +312,8 @@ Without a valid marker, or if the content is not a valid hostname, the default v
 
 | Function       | Usage |
 |----------------|-------|
-| `setup()`      | Initializes the pins and serial ports, loads the hostname, connects to Wi-Fi, starts the web server (routes `/`, `/set`, `/hostname`, `/reboot`, `/update`) and OTA, connects to MQTT, initializes the VL53L0X sensor. |
-| `loop()`       | Restores the MQTT connection if needed, processes MQTT (`client.loop()`), web requests (`webServer.handleClient()`) and OTA (`ArduinoOTA.handle()`). Every 60 s: `getStates()`, heartbeat, failure counter check. |
+| `setup()`      | Initializes the pins and serial ports, loads the hostname, connects to Wi-Fi, starts the web server (routes `/`, `/set`, `/hostname`, `/reboot`, `/update`) and OTA, connects to MQTT, initializes the VL53L0X sensor and publishes a first heartbeat. |
+| `loop()`       | Restores the MQTT connection if needed, processes MQTT (`client.loop()`), web requests (`webServer.handleClient()`) and OTA (`ArduinoOTA.handle()`). Every 60 s: `getStates()`, `updateSensorHealth()`, `publishHeartbeat()`, alive message (`pong`), failure counter check. |
 
 ### Network and MQTT
 
@@ -283,19 +336,40 @@ Without a valid marker, or if the content is not a valid hostname, the default v
 | `getTempSet()`          | Reads the temperature setpoint (EEPROM `0x6B`). |
 | `getPowerSet()`         | Reads the power setpoint (EEPROM `0xD0`). |
 | `getFumeTemp()`, `getBlowTemp()`, `getCardTemp()`, `getExtractor()`, `getBlowSpeed()`, `getVisPellet()`, `getFixVacuum()`, `getReadVacuum()`, `getMultVacuum()` | Additional reads (not called by default). |
-| `getQte()`              | Measures the distance with the VL53L0X and computes the hopper level (see 3.3). |
+| `getQte()`              | Measures the distance with the VL53L0X and computes the hopper level (see 3.3). Does nothing if the sensor is not initialized. |
 | `getStates()`           | Groups the reads of the periodic cycle. |
+
+### Sensor health and heartbeat
+
+| Function                | Usage |
+|-------------------------|-------|
+| `sensorPresentI2C()`    | Queries I²C address `0x29`: returns true if the VL53L0X answers (detects a disconnected wire without taking a measurement). |
+| `updateSensorHealth()`  | Called every 60 s: tests the sensor presence, re-initializes it (`lox.begin()`) if it came back, then computes `sensorOk` (see 3.4). |
+| `publishHeartbeat()`    | Publishes the uptime on `micronova/heartbeat` and `ON` / `OFF` on `micronova/sensorstatus`, without the retain flag. |
 
 ### Web page
 
 | Function            | Usage |
 |---------------------|-------|
-| `htmlPage()`        | Builds the page: latest measurements (height, quantity, setpoint, temperature, state, version, hostname), forms for height, hostname and reboot, link to `/update`. |
+| `htmlPage()`        | Builds the page: latest measurements (height, quantity, setpoint, temperature, state, version, hostname), "System information" card (see below), forms for height, hostname and reboot, link to `/update`. |
+| `formatUptime()`    | Formats a duration in seconds as "d h min", for the "System information" card. |
 | `handleRoot()`      | Route `GET /`: sends the page. |
 | `handleSet()`       | Route `POST /set`: stores the hopper height (value strictly between 100 and 2000). |
 | `handleHostname()`  | Route `POST /hostname`: validates, stores in EEPROM and restarts to apply the new name. |
 | `handleReboot()`    | Route `POST /reboot`: restarts the ESP. |
 | `httpUpdater`       | Route `/update`: firmware update from the browser, protected by a user name and password. |
+
+The page has a first card with the latest measurements, then (since version 0.7) a **System information** card:
+
+| Line                           | Content |
+|--------------------------------|---------|
+| Uptime                         | Time since the last startup (days, hours, minutes) |
+| Last reset reason              | `ESP.getResetReason()` |
+| Wi-Fi                          | Network name (SSID) and signal strength in dBm |
+| IP address, MAC address        | The ESP's addresses |
+| MQTT                           | "Connecte" (green) or "Deconnecte" (red) |
+| Capteur pellets (VL53L0X)      | "OK" (green) or "En defaut" (red), taken from `sensorOk` (updated every 60 s) |
+| Memoire libre                  | Free memory in KB, with heap fragmentation in % |
 
 <img width="570" height="900" alt="image" src="https://github.com/user-attachments/assets/646224df-453b-48f2-a0ad-2de1de22bfef" />
 
@@ -353,7 +427,7 @@ Every entity carries the same device description (the `device_information` macro
   "identifiers": ["42396f39-80d2-493b-8e8e-31a70e700bc6"],
   "model": "Micronova Controller",
   "name": "Micronova Controller",
-  "sw_version": "0.6"
+  "sw_version": "0.7"
 }
 ```
 
@@ -365,7 +439,7 @@ Every entity carries the same device description (the `device_information` macro
 |-----------|---------------|-------------------------|-------------------|-------|
 | `select`  | Temperature   | `micronova/settemp`     | `micronova/cmd`   | Options 17 to 21 in 0.5 steps. `command_template`: `T{{ ((value \| float) * 2) \| int }}` |
 | `switch`  | Controller    | `micronova/onoff`       | `micronova/cmd`   | `payload_on` = `ON`, `payload_off` = `OFF` |
-| `sensor`  | Controller    | `micronova/pong`        | —                 | Heartbeat ("Connecté") |
+| `sensor`  | Controller    | `micronova/pong`        | —                 | Alive message ("Connecté") |
 | `sensor`  | Temperature   | `micronova/ambtemp`     | —                 | °C, `device_class: temperature` |
 | `sensor`  | Consigne      | `micronova/tempset`     | —                 | °C, `device_class: temperature` |
 | `sensor`  | State         | `micronova/stovestate`  | —                 | Stove state text |
@@ -373,6 +447,8 @@ Every entity carries the same device description (the `device_information` macro
 | `sensor`  | Quantite      | `micronova/qte`         | —                 | % |
 | `sensor`  | log           | `micronova/log`         | —                 | Log messages |
 | `sensor`  | hauteur       | `micronova/hauteur`     | —                 | Hopper height |
+| `sensor`  | Heartbeat     | `micronova/heartbeat`   | —                 | Uptime in seconds, `device_class: duration`, diagnostic category, `expire_after` 180 s |
+| `binary_sensor` | Capteur pellets | `micronova/sensorstatus` | —          | `payload_on` = `ON`, `payload_off` = `OFF`, `device_class: connectivity`, `expire_after` 180 s |
 
 ### Anatomy of a message (example: temperature sensor)
 
@@ -403,6 +479,15 @@ The select works in °C, whereas the stove stores the setpoint ×2:
 
 The code also contains, commented out, a variant using a `number` entity (slider from 15 to 25 in 0.5 steps). A `number` is a possible alternative to the select if you want to drive the setpoint from a thermostat card.
 
+### Special case: heartbeat and `expire_after`
+
+The **Heartbeat** and **Capteur pellets** entities declare `"expire_after": 180`: if HA receives no message on their topic for 180 seconds, it marks them "unavailable". Since the ESP publishes every 60 s, three messages in a row must be missed to get there. Their state messages are not retained (see 3.4): otherwise, HA would receive an old message at startup and believe the ESP is alive. Their discovery topics:
+
+```
+homeassistant/sensor/Micronova/Heartbeat/config
+homeassistant/binary_sensor/Micronova/PelletSensor/config
+```
+
 ### Changing or removing an entity
 
 | Situation | What to do |
@@ -415,7 +500,7 @@ The code also contains, commented out, a variant using a `number` entity (slider
 
 ## 6. Appendix: known issues
 
-These points come from reading the code. They are not fixed in version 0.6.
+These points come from reading the code. They are not fixed in version 0.7.
 
 1. **Hopper height is not kept.** `hauteur_cuve` goes back to 500 mm at every restart. The MQTT `H` command meant to restore it reads the value without assigning it, and only accepts 3-character messages.
 2. **Possible crash on `P`.** A `P` message followed by a character other than 0 to 5 leaves a null pointer (`stovePW`) that is then used for the write.
@@ -423,3 +508,6 @@ These points come from reading the code. They are not fixed in version 0.6.
 4. **Switch states.** The switch expects `ON` / `OFF` on `micronova/onoff` (`state_on` / `state_off`), while the firmware publishes `Marche`, `Eteint`, `Arrêt` or `Attente`. To check: HA may ignore these messages and not reflect the real state.
 5. **Blocking waits.** Each read blocks for 80 ms, each command for 2 seconds, the sensor measurement adds 200 ms, and MQTT reconnection waits up to 5 seconds per attempt. During these pauses, the web page, MQTT and OTA do not respond.
 6. **Unused reads.** The functions reading flue gas, blower, auger and vacuum values are not called in the periodic cycle.
+7. **No automatic restart if the sensor disappears from the I²C bus.** In that case, `getQte()` returns before the measurement and therefore adds no error to `count_reboot`: the restart after more than 10 failures no longer triggers. It remains active for out-of-range distances. The failure is reported to HA through `micronova/sensorstatus`.
+8. **Slow detection of out-of-range readings.** Since a measurement is only taken every 11 cycles, a sensor returning out-of-range values can take up to 11 minutes to be flagged as faulty. A disconnected sensor is detected in under a minute.
+9. **Uptime limited to about 49 days.** The uptime in the heartbeat and on the web page comes from `millis()`, which wraps to zero after about 49.7 days.
