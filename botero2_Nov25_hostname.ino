@@ -13,7 +13,7 @@
     #include "secrets.h"
 
 //Version du firmware (a incrementer a chaque nouvelle version)
-    #define FW_VERSION "0.8"
+    #define FW_VERSION "0.11"
 
 
 //MQTT Variables
@@ -43,6 +43,11 @@ bool hauteur_set = false;        // indique si modifiée via web
     #define EEPROM_SIZE 64
     #define EEPROM_MAGIC 0xA5   // marqueur : un hostname valide est stocke en EEPROM
     String espHostname = DEFAULT_HOSTNAME;
+
+//Hauteur de la cuve en EEPROM (octet 40 = marqueur, octets 41-42 = valeur en mm, poids faible puis fort)
+//Le hostname occupe les octets 0 a 33 : pas de chevauchement.
+    #define HAUTEUR_ADDR 40
+    #define HAUTEUR_MAGIC 0xB7
 
 //Mise a jour OTA (identifiants a changer !)
 
@@ -86,6 +91,30 @@ void saveHostname(const String &name)
     for (size_t i = 0; i < name.length(); i++) EEPROM.write(2 + i, name[i]);
     EEPROM.commit();
     espHostname = name;
+}
+
+//Lit la hauteur de cuve en EEPROM (garde la valeur par defaut si absente ou hors plage)
+void loadHauteur()
+{
+    if (EEPROM.read(HAUTEUR_ADDR) == HAUTEUR_MAGIC)
+    {
+        int stored = EEPROM.read(HAUTEUR_ADDR + 1) | (EEPROM.read(HAUTEUR_ADDR + 2) << 8);
+        if (stored > 100 && stored < 2000) hauteur_cuve = stored;
+    }
+}
+
+//Enregistre la hauteur de cuve en EEPROM (n'ecrit que si la valeur a change, pour menager la flash)
+void saveHauteur(int valeur)
+{
+    int stored = -1;
+    if (EEPROM.read(HAUTEUR_ADDR) == HAUTEUR_MAGIC)
+        stored = EEPROM.read(HAUTEUR_ADDR + 1) | (EEPROM.read(HAUTEUR_ADDR + 2) << 8);
+    if (stored == valeur) return;
+
+    EEPROM.write(HAUTEUR_ADDR, HAUTEUR_MAGIC);
+    EEPROM.write(HAUTEUR_ADDR + 1, valeur & 0xFF);
+    EEPROM.write(HAUTEUR_ADDR + 2, (valeur >> 8) & 0xFF);
+    EEPROM.commit();
 }
 
 WiFiClient espClient;
@@ -1077,6 +1106,34 @@ void publishHeartbeat()
     client.publish(ip_topic, WiFi.localIP().toString().c_str(), true);
 }
 
+//Mode alignement du capteur : mesures en continu pendant N secondes (non bloquant).
+//Le VL53L0X n'emet son infrarouge (940 nm) que pendant une mesure : en mesurant en boucle,
+//le point reste visible a la camera d'un telephone, et la distance s'affiche en direct sur la page web.
+    #define ALIGN_DEFAULT_S 10
+    #define ALIGN_MAX_S 120
+    bool alignActive = false;
+    unsigned long alignEnd = 0;
+    int alignDistance = 0;
+    int alignStatus = -1;        // RangeStatus du VL53L0X : 0 = mesure valide, 4 = pas de retour, -1 = aucune mesure
+
+//Appelee a chaque tour de loop() : une mesure tant que le mode alignement est actif
+void alignTick()
+{
+    if (!alignActive) return;
+
+    if ((long)(millis() - alignEnd) >= 0)
+    {
+        alignActive = false;
+        Write_Log(client, "Align : mode alignement termine.");
+        return;
+    }
+
+    VL53L0X_RangingMeasurementData_t m;
+    lox.rangingTest(&m, false);
+    alignDistance = m.RangeMilliMeter;
+    alignStatus = m.RangeStatus;
+}
+
 void getStates() //Calls all the get…() functions
 {
     getStovePower();
@@ -1087,186 +1144,425 @@ void getStates() //Calls all the get…() functions
     getQte();  // Mesure du VL53L0X
 }
 
-//Page Web (HTML minimaliste)
-//Formate une duree en secondes : "3 j 4 h 12 min"
-String formatUptime(unsigned long totalSeconds)
-{
-    unsigned long days = totalSeconds / 86400UL;
-    unsigned long hours = (totalSeconds % 86400UL) / 3600UL;
-    unsigned long minutes = (totalSeconds % 3600UL) / 60UL;
-    String s = "";
-    if (days > 0) s += String(days) + " j ";
-    s += String(hours) + " h " + String(minutes) + " min";
-    return s;
+//Interface web (inspiree de watermeter2mqtt) : page statique en PROGMEM + API JSON /api/status.
+//La page se rafraichit toute seule (toutes les 5 s, toutes les 0,5 s pendant l'alignement) et les actions
+//(hauteur, hostname, alignement, redemarrage, mise a jour OTA) passent par fetch/XHR sans recharger la page.
+//Toutes les pages sont protegees par les identifiants ota_user / ota_pass (secrets.h).
+
+const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Poêle Micronova</title>
+<style>
+  :root { --bg:#f3f5f8; --card:#fff; --txt:#1c2530; --mut:#6b7785; --acc:#1f7ae0; --ok:#1e9e5a; --ko:#d64545; --bd:#e1e6ec; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#12171d; --card:#1b222b; --txt:#e8edf2; --mut:#93a0ae; --bd:#2a3440; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:system-ui,sans-serif; background:var(--bg); color:var(--txt); }
+  main { max-width:720px; margin:0 auto; padding:16px; }
+  h1 { font-size:1.4rem; margin:8px 0 16px; }
+  h2 { font-size:1.05rem; margin:0 0 12px; }
+  .card { background:var(--card); border:1px solid var(--bd); border-radius:12px; padding:16px; margin-bottom:16px; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  .item span { display:block; color:var(--mut); font-size:.8rem; }
+  .item b { font-size:1.05rem; word-break:break-all; }
+  .big b { font-size:1.8rem; }
+  .hint { color:var(--mut); font-size:.85rem; margin:0 0 12px; }
+  label { display:block; margin:10px 0 4px; font-size:.85rem; color:var(--mut); }
+  input, select { width:100%; padding:10px; border:1px solid var(--bd); border-radius:8px; background:var(--bg); color:var(--txt); font-size:1rem; }
+  button { padding:10px 16px; border:0; border-radius:8px; font-size:1rem; cursor:pointer; background:var(--acc); color:#fff; }
+  button:disabled { opacity:.5; cursor:default; }
+  button.danger { background:var(--ko); }
+  .row { display:flex; gap:8px; margin-top:14px; flex-wrap:wrap; }
+  .dot { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:6px; background:var(--ko); }
+  .dot.on { background:var(--ok); }
+  .ok { color:var(--ok); } .ko { color:var(--ko); }
+  .msg { margin-top:10px; font-size:.9rem; color:var(--mut); }
+  @media (max-width:480px) { .grid { grid-template-columns:1fr; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>🔥 Contrôleur poêle Micronova</h1>
+
+  <div class="card">
+    <h2>Poêle</h2>
+    <div class="grid">
+      <div class="item big"><span>Température</span><b id="temp">–</b></div>
+      <div class="item big"><span>Consigne</span><b id="consigne">–</b></div>
+    </div>
+    <div class="item" style="margin-top:12px"><span>État du poêle</span><b id="state">–</b></div>
+  </div>
+
+  <div class="card">
+    <h2>Pellets</h2>
+    <div class="grid">
+      <div class="item big"><span>Quantité restante</span><b id="qte">–</b></div>
+      <div class="item big"><span>Hauteur lue</span><b id="dist">–</b></div>
+    </div>
+    <form id="hform">
+      <label for="hin">Hauteur de la cuve (mm)</label>
+      <input id="hin" name="hauteur" type="number" min="101" max="1999" required>
+      <div class="row"><button type="submit">Enregistrer</button></div>
+    </form>
+    <div class="msg" id="hmsg"></div>
+  </div>
+
+  <div class="card">
+    <h2>Alignement du capteur</h2>
+    <p class="hint">Lance des mesures en continu : le point infrarouge reste visible à la caméra d'un téléphone (caméra frontale de préférence) et la distance s'affiche en direct ci-dessous.</p>
+    <div class="grid">
+      <div class="item big"><span>Distance</span><b id="aldist">–</b></div>
+      <div class="item"><span>État</span><b id="alstate">–</b></div>
+    </div>
+    <div class="item" style="margin-top:12px"><span>Qualité de la mesure</span><b id="alq">–</b></div>
+    <label for="aldur">Durée</label>
+    <select id="aldur">
+      <option value="10">10 s</option>
+      <option value="30">30 s</option>
+      <option value="60">60 s</option>
+      <option value="120">120 s</option>
+    </select>
+    <div class="row"><button id="alstart">Lancer l'alignement</button></div>
+    <div class="msg" id="almsg"></div>
+  </div>
+
+  <div class="card">
+    <h2>Système</h2>
+    <div class="grid">
+      <div class="item"><span>Adresse IP</span><b id="ip">–</b></div>
+      <div class="item"><span>Hostname</span><b id="host">–</b></div>
+      <div class="item"><span>Wi-Fi</span><b id="ssid">–</b></div>
+      <div class="item"><span>Signal</span><b id="rssi">–</b></div>
+      <div class="item"><span>Adresse MAC</span><b id="mac">–</b></div>
+      <div class="item"><span>MQTT</span><b><i class="dot" id="mqttdot"></i><span id="mqtt" style="display:inline;font-size:inherit;color:inherit">–</span></b></div>
+      <div class="item"><span>Capteur pellets (VL53L0X)</span><b><i class="dot" id="sensdot"></i><span id="sens" style="display:inline;font-size:inherit;color:inherit">–</span></b></div>
+      <div class="item"><span>Uptime</span><b id="uptime">–</b></div>
+      <div class="item"><span>Dernier reset</span><b id="reset">–</b></div>
+      <div class="item"><span>Mémoire libre</span><b id="heap">–</b></div>
+      <div class="item"><span>Version du firmware</span><b id="version">–</b></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Configuration</h2>
+    <form id="hostform">
+      <label for="hostIn">Hostname (lettres, chiffres, tirets)</label>
+      <input id="hostIn" name="hostname" pattern="[A-Za-z0-9\-]{1,32}" maxlength="32" required>
+      <div class="row"><button type="submit">Enregistrer et redémarrer</button></div>
+    </form>
+    <div class="msg" id="hostmsg"></div>
+  </div>
+
+  <div class="card">
+    <h2>Mise à jour du firmware (OTA)</h2>
+    <form id="fwForm">
+      <label for="fwFile">Fichier .bin (Croquis > Exporter les binaires compilés)</label>
+      <input id="fwFile" type="file" accept=".bin" required>
+      <div class="row">
+        <button type="submit" id="fwBtn">Envoyer et installer</button>
+      </div>
+    </form>
+    <div class="msg" id="fwmsg"></div>
+  </div>
+
+  <div class="card">
+    <h2>Maintenance</h2>
+    <div class="row" style="margin-top:0">
+      <button class="danger" id="reboot">Redémarrer l'ESP</button>
+    </div>
+    <div class="msg" id="sysmsg"></div>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let formFilled = false;
+let timer = null;
+
+function fmtUptime(s) {
+  const d = Math.floor(s/86400), h = Math.floor(s%86400/3600), m = Math.floor(s%3600/60);
+  return (d ? d+' j ' : '') + h + ' h ' + m + ' min';
 }
 
-String htmlPage()
+function fmtC(v) {
+  const n = parseFloat(v);
+  return isNaN(n) ? '–' : n.toFixed(1) + ' °C';
+}
+
+async function post(url, params) {
+  const r = await fetch(url, { method:'POST', body:new URLSearchParams(params || {}) });
+  return { ok:r.ok, text:await r.text() };
+}
+
+async function refresh() {
+  let next = 5000;
+  try {
+    const r = await fetch('/api/status');
+    const s = await r.json();
+    $('temp').textContent     = fmtC(s.temperature);
+    $('consigne').textContent = fmtC(s.consigne);
+    $('state').textContent    = s.state;
+    $('qte').textContent      = s.qte < 0 ? '–' : s.qte.toFixed(1) + ' %';
+    $('dist').textContent     = s.distance > 0 ? s.distance + ' mm' : '–';
+
+    $('aldist').textContent  = s.alignStatus < 0 ? '–' : s.alignDistance + ' mm';
+    $('alstate').textContent = s.alignActive ? 'Infrarouge actif : ' + s.alignRemain + ' s' : 'Arrêté';
+    let q = '–';
+    if (s.alignStatus === 0) q = 'Mesure valide';
+    else if (s.alignStatus === 4) q = 'Pas de retour (cible hors portée, trop sombre ou mal orientée)';
+    else if (s.alignStatus > 0) q = 'Mesure douteuse (code ' + s.alignStatus + ')';
+    $('alq').textContent = q;
+    $('alq').className = s.alignStatus === 0 ? 'ok' : (s.alignStatus > 0 ? 'ko' : '');
+    $('alstart').disabled = s.alignActive;
+    if (s.alignActive) next = 500;   // suivi en direct pendant l'alignement
+
+    $('ip').textContent    = s.ip;
+    $('host').textContent  = s.hostname + '.local';
+    $('ssid').textContent  = s.ssid;
+    $('rssi').textContent  = s.rssi + ' dBm';
+    $('mac').textContent   = s.mac;
+    $('mqtt').textContent  = s.mqtt ? 'Connecté' : 'Déconnecté';
+    $('mqttdot').className = 'dot' + (s.mqtt ? ' on' : '');
+    $('sens').textContent  = s.sensorOk ? 'OK' : 'En défaut';
+    $('sensdot').className = 'dot' + (s.sensorOk ? ' on' : '');
+    $('uptime').textContent  = fmtUptime(s.uptime);
+    $('reset').textContent   = s.resetReason;
+    $('heap').textContent    = s.heap + ' ko (fragmentation ' + s.frag + ' %)';
+    $('version').textContent = s.version + ' (' + s.build + ')';
+    if (!formFilled) {
+      $('hin').value = s.hauteur;
+      $('hostIn').value = s.hostname;
+      formFilled = true;
+    }
+  } catch (e) { /* ESP injoignable (redémarrage ?) */ }
+  clearTimeout(timer);
+  timer = setTimeout(refresh, next);
+}
+
+$('hform').onsubmit = async ev => {
+  ev.preventDefault();
+  try { $('hmsg').textContent = (await post('/set', { hauteur: $('hin').value })).text; }
+  catch (e) { $('hmsg').textContent = 'Erreur lors de l\'envoi.'; }
+  refresh();
+};
+
+$('alstart').onclick = async () => {
+  try { $('almsg').textContent = (await post('/align/start', { duree: $('aldur').value })).text; }
+  catch (e) { $('almsg').textContent = 'Erreur lors de l\'envoi.'; }
+  refresh();
+};
+
+$('hostform').onsubmit = async ev => {
+  ev.preventDefault();
+  try {
+    const r = await post('/hostname', { hostname: $('hostIn').value });
+    $('hostmsg').textContent = r.text;
+    if (r.ok && r.text.indexOf('Redémarrage') >= 0) setTimeout(() => location.reload(), 15000);
+  } catch (e) { $('hostmsg').textContent = 'Erreur lors de l\'envoi.'; }
+};
+
+$('fwForm').onsubmit = ev => {
+  ev.preventDefault();
+  const f = $('fwFile').files[0];
+  if (!f) return;
+  if (!confirm('Installer ' + f.name + ' ? L\'ESP redémarrera ensuite.')) return;
+  const x = new XMLHttpRequest();
+  x.open('POST', '/update');
+  x.upload.onprogress = e => {
+    if (e.lengthComputable) $('fwmsg').textContent = 'Envoi : ' + Math.round(e.loaded * 100 / e.total) + ' %';
+  };
+  x.onload = () => {
+    if (x.status === 200) {
+      $('fwmsg').textContent = 'Mise à jour installée. Redémarrage… la page se rechargera dans 20 s.';
+      setTimeout(() => location.reload(), 20000);
+    } else {
+      $('fwmsg').textContent = 'Échec de la mise à jour : ' + x.responseText;
+      $('fwBtn').disabled = false;
+    }
+  };
+  x.onerror = () => { $('fwmsg').textContent = 'Erreur réseau pendant l\'envoi.'; $('fwBtn').disabled = false; };
+  $('fwBtn').disabled = true;
+  const fd = new FormData();
+  fd.append('update', f, f.name);
+  x.send(fd);
+};
+
+$('reboot').onclick = async () => {
+  if (!confirm('Redémarrer l\'ESP ?')) return;
+  try { await fetch('/reboot', { method:'POST' }); } catch (e) {}
+  $('sysmsg').textContent = 'Redémarrage en cours… la page se rechargera dans 15 s.';
+  setTimeout(() => location.reload(), 15000);
+};
+
+refresh();
+</script>
+</body>
+</html>
+)rawliteral";
+
+//Echappe une chaine pour l'inclure dans du JSON
+String jsonEscape(const String &in)
 {
-    String page = "<!DOCTYPE html><html><head>";
-    page += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
-    page += "<title>Micronova - Configuration</title>";
+    String out;
+    out.reserve(in.length() + 8);
+    for (size_t i = 0; i < in.length(); i++)
+    {
+        char c = in[i];
+        if (c == '"' || c == '\\') { out += '\\'; out += c; }
+        else if (c == '\n') out += "\\n";
+        else if (c == '\r') {}
+        else out += c;
+    }
+    return out;
+}
 
-    // Ajout de styles CSS
-    page += "<style>";
-    page += "body { font-family: Arial, sans-serif; background-color: #f4f4f9; color: #333; text-align: center; padding: 20px; }";
-    page += "h2 { color: #2c3e50; }";
-    page += "h3 { color: #2c3e50; margin: 0 0 10px 0; }";
-    page += ".ok { color: #27ae60; } .ko { color: #e74c3c; }";
-    page += "form { background: white; padding: 20px; margin: 20px auto; border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.2); max-width: 400px; }";
-    page += "input[type=number], input[type=text] { width: 100%; padding: 10px; margin: 10px 0; border-radius: 5px; border: 1px solid #ccc; }";
-    page += "input[type=submit] { background-color: #3498db; color: white; padding: 10px 20px; border: none; border-radius: 5px; font-size: 16px; cursor: pointer; transition: background 0.3s; }";
-    page += "input[type=submit]:hover { background-color: #2980b9; }";
-    page += ".reboot-btn { background-color: #e74c3c; }";
-    page += ".reboot-btn:hover { background-color: #c0392b; }";
-    page += ".card { background: #fff; padding: 15px; margin: 15px auto; border-radius: 10px; box-shadow: 0 2px 6px rgba(0,0,0,0.2); max-width: 400px; }";
-    page += "p { font-size: 18px; margin: 10px 0; }";
-    page += "b { color: #2c3e50; }";
-    page += "</style>";
-
-    page += "</head><body>";
-    page += "<h2>ESP Poele</h2>";
-
-    // Carte pour les dernieres mesures
-    page += "<div class='card'>";
-	page += "<p>Hauteur cuve : <b>" + String(hauteur_cuve) + " mm</b></p>";
-    page += "<p>Hauteur lue : <b>" + String(distance) + " mm</b></p>";
-	page += "<p>Quantite restante : <b>" + String(lastQte, 1) + " %</b></p>";
-	page += "<p>Consigne : <b>" + String(consigne) + " C</b></p>";
-	page += "<p>Temperature : <b>" + String(temperature) + " C</b></p>";
-	page += "<p>Etat du poele : <b>" + String(stove_state) + "</b></p>";
-    page += "<p>Version : <b>" FW_VERSION "</b> <small>(" __DATE__ " " __TIME__ ")</small></p>";
-    page += "<p>Hostname : <b>" + espHostname + "</b></p>";
-    page += "</div>";
-
-    // Carte Informations systeme
-    page += "<div class='card'>";
-    page += "<h3>Informations systeme</h3>";
-    page += "<p>Uptime : <b>" + formatUptime(millis() / 1000UL) + "</b></p>";
-    page += "<p>Cause du dernier reset : <b>" + ESP.getResetReason() + "</b></p>";
-    page += "<p>Wi-Fi : <b>" + WiFi.SSID() + "</b> (" + String(WiFi.RSSI()) + " dBm)</p>";
-    page += "<p>Adresse IP : <b>" + WiFi.localIP().toString() + "</b></p>";
-    page += "<p>Adresse MAC : <b>" + WiFi.macAddress() + "</b></p>";
-    page += "<p>MQTT : <b class='" + String(client.connected() ? "ok" : "ko") + "'>" + String(client.connected() ? "Connecte" : "Deconnecte") + "</b></p>";
-    page += "<p>Capteur pellets (VL53L0X) : <b class='" + String(sensorOk ? "ok" : "ko") + "'>" + String(sensorOk ? "OK" : "En defaut") + "</b></p>";
-    page += "<p>Memoire libre : <b>" + String(ESP.getFreeHeap() / 1024.0, 1) + " ko</b> (fragmentation " + String(ESP.getHeapFragmentation()) + " %)</p>";    
-    page += "</div>";
-	
-	// Formulaire pour la hauteur
-    page += "<form action='/set' method='POST'>";
-    page += "<label>Hauteur cuve (mm):</label><br>";
-    page += "<input type='number' name='hauteur' value='" + String(hauteur_cuve) + "' min='100' max='2000'><br><br>";
-    page += "<input type='submit' value='Enregistrer'>";
-    page += "</form>";
-
-    // Formulaire pour le hostname
-    page += "<form action='/hostname' method='POST'>";
-    page += "<label>Hostname (lettres, chiffres, tirets) :</label><br>";
-    page += "<input type='text' name='hostname' value='" + espHostname + "' maxlength='32' required><br><br>";
-    page += "<input type='submit' value='Enregistrer'>";
-    page += "</form>";
-
-    // Formulaire pour le reboot
-    page += "<form action='/reboot' method='POST'>";
-    page += "<input type='submit' value='Redemarrer' class='reboot-btn'>";
-    page += "</form>";
-    
-    page += "<p><a href='/update'>Mise a jour du firmware (OTA)</a></p>";
-
-    page += "</body></html>";
-
-    return page;
+//Authentification HTTP basique (memes identifiants que la mise a jour OTA)
+bool checkAuth()
+{
+    if (!webServer.authenticate(ota_user, ota_pass))
+    {
+        webServer.requestAuthentication();
+        return false;
+    }
+    return true;
 }
 
 //Handlers HTTP
 void handleRoot()
 {
-    Serial.println("HTTP / appelé");
-    webServer.send(200, "text/html", htmlPage());
+    if (!checkAuth()) return;
+    webServer.send_P(200, "text/html; charset=utf-8", INDEX_HTML);
 }
 
-//Réception du formulaire /set
+//GET /api/status : tout l'etat en JSON, interroge par la page
+void handleStatus()
+{
+    if (!checkAuth()) return;
+
+    long alignRemain = alignActive ? (long)(alignEnd - millis()) / 1000L + 1 : 0;
+    if (alignRemain < 0) alignRemain = 0;
+
+    String j = "{";
+    j += "\"temperature\":\"" + jsonEscape(temperature) + "\"";
+    j += ",\"consigne\":\"" + jsonEscape(consigne) + "\"";
+    j += ",\"state\":\"" + jsonEscape(stove_state) + "\"";
+    j += ",\"distance\":" + String(distance);
+    j += ",\"qte\":" + String(lastQte, 1);
+    j += ",\"hauteur\":" + String(hauteur_cuve);
+    j += ",\"alignActive\":" + String(alignActive ? "true" : "false");
+    j += ",\"alignRemain\":" + String(alignRemain);
+    j += ",\"alignDistance\":" + String(alignDistance);
+    j += ",\"alignStatus\":" + String(alignStatus);
+    j += ",\"ip\":\"" + WiFi.localIP().toString() + "\"";
+    j += ",\"hostname\":\"" + jsonEscape(espHostname) + "\"";
+    j += ",\"ssid\":\"" + jsonEscape(WiFi.SSID()) + "\"";
+    j += ",\"rssi\":" + String(WiFi.RSSI());
+    j += ",\"mac\":\"" + WiFi.macAddress() + "\"";
+    j += ",\"mqtt\":" + String(client.connected() ? "true" : "false");
+    j += ",\"sensorOk\":" + String(sensorOk ? "true" : "false");
+    j += ",\"uptime\":" + String(millis() / 1000UL);
+    j += ",\"resetReason\":\"" + jsonEscape(ESP.getResetReason()) + "\"";
+    j += ",\"heap\":" + String(ESP.getFreeHeap() / 1024.0, 1);
+    j += ",\"frag\":" + String(ESP.getHeapFragmentation());
+    j += ",\"version\":\"" FW_VERSION "\"";
+    j += ",\"build\":\"" __DATE__ " " __TIME__ "\"";
+    j += "}";
+
+    webServer.sendHeader("Cache-Control", "no-store");
+    webServer.send(200, "application/json", j);
+}
+
+//POST /set : hauteur de la cuve (enregistree en EEPROM)
 void handleSet()
 {
+    if (!checkAuth()) return;
     Serial.println("HTTP hauteur appelé");
-    if (webServer.hasArg("hauteur"))
+
+    int newHauteur = webServer.arg("hauteur").toInt();
+    if (newHauteur > 100 && newHauteur < 2000) // sécurité
     {
-        int newHauteur = webServer.arg("hauteur").toInt();
+        hauteur_cuve = newHauteur;
+        hauteur_set = true;
+        saveHauteur(hauteur_cuve);   // conservee apres un redemarrage
 
-        if (newHauteur > 100 && newHauteur < 2000) // sécurité
-        {
-            hauteur_cuve = newHauteur;
-            hauteur_set = true;
-
-            Write_Log(client, "WEB : hauteur_cuve mise à jour = " + String(hauteur_cuve));
-        }
+        Write_Log(client, "WEB : hauteur_cuve mise à jour = " + String(hauteur_cuve));
+        webServer.send(200, "text/plain; charset=utf-8", "Hauteur enregistrée : " + String(hauteur_cuve) + " mm.");
     }
-    webServer.sendHeader("Location", "/");
-    webServer.send(303);
+    else
+    {
+        webServer.send(400, "text/plain; charset=utf-8", "Hauteur invalide (101 à 1999 mm).");
+    }
 }
 
-//Reception du formulaire /hostname
+//POST /hostname : nouveau hostname (EEPROM), applique au redemarrage
 void handleHostname()
 {
+    if (!checkAuth()) return;
     Serial.println("HTTP hostname appele");
-    if (webServer.hasArg("hostname"))
+
+    String newHostname = webServer.arg("hostname");
+    newHostname.trim();
+
+    if (!isValidHostname(newHostname))
     {
-        String newHostname = webServer.arg("hostname");
-        newHostname.trim();
-
-        if (!isValidHostname(newHostname))
-        {
-            webServer.send(400, "text/html",
-                "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'></head><body>"
-                "<h2>Hostname invalide</h2>"
-                "<p>1 a 32 caracteres : lettres, chiffres et tirets (pas de tiret au debut ou a la fin).</p>"
-                "<p><a href='/'>Retour</a></p>"
-                "</body></html>"
-            );
-            return;
-        }
-
-        if (newHostname != espHostname)
-        {
-            saveHostname(newHostname);
-            Write_Log(client, "WEB : hostname modifie = " + newHostname + " (redemarrage)");
-
-            // Le nouveau hostname est applique au redemarrage (annonce DHCP)
-            webServer.send(200, "text/html",
-                "<!DOCTYPE html><html><head>"
-                "<meta http-equiv='refresh' content='8;url=/' />"
-                "</head><body>"
-                "<h2>Hostname enregistre</h2>"
-                "<p>L'ESP redemarre pour appliquer le nouveau nom.</p>"
-                "<p>Redirection automatique dans 8 secondes.</p>"
-                "</body></html>"
-            );
-            delay(1000);   // laisse le temps d'envoyer la page
-            ESP.restart();
-        }
+        webServer.send(400, "text/plain; charset=utf-8", "Hostname invalide (lettres, chiffres et tirets, 32 max).");
+        return;
     }
-    webServer.sendHeader("Location", "/");
-    webServer.send(303);
+
+    if (newHostname == espHostname)
+    {
+        webServer.send(200, "text/plain; charset=utf-8", "Hostname inchangé.");
+        return;
+    }
+
+    saveHostname(newHostname);
+    Write_Log(client, "WEB : hostname modifie = " + newHostname + " (redemarrage)");
+
+    webServer.send(200, "text/plain; charset=utf-8",
+        "Hostname enregistré. Redémarrage… reconnectez-vous sur http://" + newHostname + ".local");
+    delay(500);   // laisse le temps d'envoyer la reponse
+    ESP.restart();
 }
 
+//POST /reboot
 void handleReboot()
 {
+    if (!checkAuth()) return;
     Serial.println("HTTP reboot appelé");
-     webServer.send(200, "text/html",
-        "<!DOCTYPE html><html><head>"
-        "<meta http-equiv='refresh' content='5;url=/' />"
-        "<script>"
-        "setTimeout(function(){ window.location.href = '/'; }, 5000);"
-        "</script>"
-        "</head><body>"
-        "<h2>Redemarrage en cours...</h2>"
-        "<p>L'ESP va redemarrer.</p>"
-        "<p>Redirection automatique dans 5 secondes.</p>"
-        "</body></html>"
-    );
-    
+    webServer.send(200, "text/plain; charset=utf-8", "Redémarrage…");
     Write_Log(client, "WEB : Redémarrage ESP demandé");
-    delay(1000);   // laisse le temps d'envoyer la page
+    delay(500);   // laisse le temps d'envoyer la reponse
     ESP.restart();
+}
+
+//POST /align/start (champ "duree" en secondes) : demarre le mode alignement
+void handleAlignStart()
+{
+    if (!checkAuth()) return;
+    Serial.println("HTTP align/start appele");
+
+    if (!sensorInitialized)
+    {
+        webServer.send(503, "text/plain; charset=utf-8", "Capteur VL53L0X non disponible : vérifier le câblage (SDA/SCL, alimentation).");
+        return;
+    }
+
+    int duree = ALIGN_DEFAULT_S;
+    if (webServer.hasArg("duree")) duree = webServer.arg("duree").toInt();
+    if (duree < 5) duree = ALIGN_DEFAULT_S;
+    if (duree > ALIGN_MAX_S) duree = ALIGN_MAX_S;
+
+    alignStatus = -1;
+    alignEnd = millis() + (unsigned long)duree * 1000UL;
+    alignActive = true;
+    Write_Log(client, "Align : mode alignement demarre pour " + String(duree) + " s.");
+
+    webServer.send(200, "text/plain; charset=utf-8", "Alignement lancé pour " + String(duree) + " s.");
 }
 
 void setup()
@@ -1279,13 +1575,16 @@ void setup()
     StoveSerial.begin(1200, SERIAL_MODE, RX_PIN, TX_PIN, false, 256);
 
     //Init Wifi
-    loadHostname();
+    loadHostname();   // appelle EEPROM.begin()
+    loadHauteur();
     setup_wifi();
 
-    webServer.on("/", handleRoot);
+    webServer.on("/", HTTP_GET, handleRoot);
+    webServer.on("/api/status", HTTP_GET, handleStatus);
     webServer.on("/set", HTTP_POST, handleSet);
     webServer.on("/hostname", HTTP_POST, handleHostname);
     webServer.on("/reboot", HTTP_POST, handleReboot);
+    webServer.on("/align/start", HTTP_POST, handleAlignStart);
     httpUpdater.setup(&webServer, "/update", ota_user, ota_pass);
     webServer.begin();
 
@@ -1365,7 +1664,8 @@ void loop()
         client.loop();
         webServer.handleClient();
         ArduinoOTA.handle();
-   
+        alignTick();   // mesures en continu si le mode alignement est actif
+
     
     unsigned long currentMillis = millis();
     if (previousMillis > currentMillis)
