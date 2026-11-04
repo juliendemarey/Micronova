@@ -2,7 +2,7 @@
 
 > ESP8266 firmware that bridges a Micronova pellet stove and Home Assistant over MQTT: stove control, pellet hopper level measurement, MQTT autodiscovery, web configuration page and OTA updates.
 
-This document describes the firmware **version 0.8** (`botero2_Nov25_hostname.ino`).
+This document describes the firmware **version 0.11** (`botero2_Nov25_hostname.ino`).
 
 ## Table of contents
 
@@ -12,6 +12,7 @@ This document describes the firmware **version 0.8** (`botero2_Nov25_hostname.in
 4. [Functions and their usage](#4-functions-and-their-usage)
 5. [Focus: MQTT autodiscovery](#5-focus-mqtt-autodiscovery)
 6. [Appendix: known issues](#6-appendix-known-issues)
+7. [Version history](#7-version-history)
 
 ---
 
@@ -24,6 +25,7 @@ This firmware turns an ESP8266 into a gateway between a **pellet stove fitted wi
 - read the stove state (off, ignition, heating, alarm…), the ambient temperature, the power level and the temperature setpoint;
 - control the stove (on, off, standby, power level, temperature setpoint);
 - measure the pellet level in the hopper with a VL53L0X distance sensor;
+- help position that sensor in the hopper (alignment mode: infrared emitted continuously, distance shown live);
 - tell HA that it is alive and that the pellet sensor works (MQTT heartbeat), so that a failure can be detected, and report its IP address;
 - declare all its sensors and controls to HA automatically (MQTT discovery);
 - be configured and updated without a cable (web page, OTA).
@@ -59,13 +61,13 @@ This firmware turns an ESP8266 into a gateway between a **pellet stove fitted wi
 | File                 | Role                                                           |
 |----------------------|----------------------------------------------------------------|
 | `*.ino`              | The firmware                                                   |
-| `secrets.h`          | Wi-Fi, MQTT and OTA credentials (not versioned)                |
+| `secrets.h`          | Wi-Fi, MQTT and OTA credentials (not versioned). `ota_user` / `ota_pass` also protect the web page |
 | `secrets.example.h`  | Template for `secrets.h`                                       |
 
 ### Runtime cycle
 
-1. **Startup** (`setup`): read the hostname from EEPROM, connect to Wi-Fi, start the web server and OTA, connect to MQTT, publish the autodiscovery messages, subscribe to commands, initialize the VL53L0X sensor, publish a first heartbeat.
-2. **Loop** (`loop`), continuously: keep the MQTT connection alive, process incoming messages (commands), serve web and OTA requests.
+1. **Startup** (`setup`): read the hostname and the hopper height from EEPROM, connect to Wi-Fi, start the web server and OTA, connect to MQTT, publish the autodiscovery messages, subscribe to commands, initialize the VL53L0X sensor, publish a first heartbeat.
+2. **Loop** (`loop`), continuously: keep the MQTT connection alive, process incoming messages (commands), serve web and OTA requests, take continuous measurements if the alignment mode is active (`alignTick`).
 3. **Every 60 seconds**: poll the stove and the sensor (`getStates`), evaluate the sensor health (`updateSensorHealth`), publish the heartbeat and the IP address (`publishHeartbeat`) and an alive message (`pong`). After more than 10 failed distance measurements in a row, the ESP restarts.
 
 ---
@@ -235,7 +237,7 @@ After a write, the firmware waits 2 seconds (`ON`, `ST`, `OF`, `P`) or 10 ms (`T
 quantity (%) = (hopper_height − distance) / hopper_height × 100
 ```
 
-- `hauteur_cuve` (hopper height) is 500 mm by default and can be set from the web page (100 to 2000 mm).
+- `hauteur_cuve` (hopper height) is 500 mm by default and can be set from the web page (101 to 1999 mm). Since version 0.10, the value is kept in EEPROM and read back at startup (see 3.5).
 - A measurement is only taken **every 11 cycles** (about 11 minutes), using the `measure_sleep` counter.
 - A distance above 1000 mm counts as an error (`count_reboot`) and sets `lastMeasureOk` to false. More than 10 consecutive failed measurements restart the ESP; a valid measurement resets the counter and sets `lastMeasureOk` back to true. An "out of range" sensor status (status 4) is only logged and does not count.
 - If the sensor is not initialized (missing at startup, or gone from the I²C bus), `getQte()` does not attempt any measurement: it sets `lastMeasureOk` to false, logs it and returns (see 3.4).
@@ -297,15 +299,29 @@ mode: single
 
 ### 3.5 Local storage (ESP EEPROM)
 
-Only the hostname is kept in EEPROM (64 bytes reserved):
+The hostname and, since version 0.10, the hopper height are kept in EEPROM (64 bytes reserved):
 
 | Byte | Content                                  |
 |------|------------------------------------------|
 | 0    | Marker `0xA5` (a hostname is stored)     |
 | 1    | Hostname length (1 to 32)                |
-| 2…   | Hostname characters                      |
+| 2 to 33 | Hostname characters                  |
+| 40    | Marker `0xB7` (a hopper height is stored) |
+| 41    | Hopper height in mm, low byte             |
+| 42    | Hopper height in mm, high byte            |
 
-Without a valid marker, or if the content is not a valid hostname, the default value `micronova` is used.
+Without a valid marker, or if the content is not a valid hostname, the default value `micronova` is used. In the same way, without a valid `0xB7` marker, or if the height is not between 101 and 1999 mm, the default value of 500 mm is kept. The height is only written when it has changed, to spare the flash.
+
+### 3.6 Sensor alignment mode
+
+Since version 0.9, the web page offers an alignment mode to position the VL53L0X in the hopper. The sensor only emits its infrared light (940 nm) during a measurement: normally, that is a few milliseconds every 11 minutes, so nothing is visible. In alignment mode, the ESP measures continuously (about 20 times per second) for the chosen duration. The infrared dot becomes visible to a phone camera (the front camera, whose infrared filter is often weaker, works better), and the distance is shown live on the page.
+
+- **Start**: `POST /align/start` with the duration in seconds. The page offers 10, 30, 60 or 120 s; accepted values range from 5 to 120 s, with 10 s by default. The request is refused (HTTP 503) if the sensor is not initialized.
+- **How it works**: non-blocking. `alignTick()` is called on every pass of `loop()` and takes one measurement (`lox.rangingTest`) while the mode is active. MQTT, the web page and OTA keep answering.
+- **End**: automatic when the time is up (log message `Align : mode alignement termine.`).
+- **Live view**: the page reads `alignActive`, `alignRemain`, `alignDistance` and `alignStatus` from `/api/status`, every 0.5 s during the alignment. `alignStatus` is the VL53L0X status code: 0 = valid measurement, 4 = no return (target out of range, too dark or badly aimed), any other value = doubtful measurement, -1 = no measurement.
+- **Scope of the measurements**: they are not published to MQTT and do not change `distance`, the quantity or `lastMeasureOk`.
+- **Tip**: the beam is a cone of about 25°. Keep it clear of the hopper walls and lid; a distance that jumps around or a "no return" status means a bad alignment.
 
 ---
 
@@ -315,8 +331,8 @@ Without a valid marker, or if the content is not a valid hostname, the default v
 
 | Function       | Usage |
 |----------------|-------|
-| `setup()`      | Initializes the pins and serial ports, loads the hostname, connects to Wi-Fi, starts the web server (routes `/`, `/set`, `/hostname`, `/reboot`, `/update`) and OTA, connects to MQTT, initializes the VL53L0X sensor and publishes a first heartbeat. |
-| `loop()`       | Restores the MQTT connection if needed, processes MQTT (`client.loop()`), web requests (`webServer.handleClient()`) and OTA (`ArduinoOTA.handle()`). Every 60 s: `getStates()`, `updateSensorHealth()`, `publishHeartbeat()`, alive message (`pong`), failure counter check. |
+| `setup()`      | Initializes the pins and serial ports, loads the hostname and the hopper height, connects to Wi-Fi, starts the web server (routes `/`, `/api/status`, `/set`, `/hostname`, `/reboot`, `/align/start`, `/update`) and OTA, connects to MQTT, initializes the VL53L0X sensor and publishes a first heartbeat. |
+| `loop()`       | Restores the MQTT connection if needed, processes MQTT (`client.loop()`), web requests (`webServer.handleClient()`) and OTA (`ArduinoOTA.handle()`), then `alignTick()` (continuous measurements in alignment mode). Every 60 s: `getStates()`, `updateSensorHealth()`, `publishHeartbeat()`, alive message (`pong`), failure counter check. |
 
 ### Network and MQTT
 
@@ -352,29 +368,40 @@ Without a valid marker, or if the content is not a valid hostname, the default v
 
 ### Web page
 
+Since version 0.11, the interface is modelled on the `watermeter2mqtt` project: the page is stored once in program memory (`INDEX_HTML`) and **queries the ESP** (`GET /api/status`, JSON answer) to display the state. It refreshes itself every 5 s (every 0.5 s during an alignment). Actions go through background requests, without reloading the page: each one returns a short text message, shown under the form. The light or dark theme follows the device's.
+
+**Protected access**: the routes ask for a user name and a password (HTTP basic authentication, `checkAuth()`), which are the `ota_user` / `ota_pass` of `secrets.h`. The `/update` route is protected by the same pair.
+
 | Function            | Usage |
 |---------------------|-------|
-| `htmlPage()`        | Builds the page: latest measurements (height, quantity, setpoint, temperature, state, version, hostname), "System information" card (see below), forms for height, hostname and reboot, link to `/update`. |
-| `formatUptime()`    | Formats a duration in seconds as "d h min", for the "System information" card. |
+| `INDEX_HTML`        | The complete page (HTML, CSS, JavaScript), kept in program memory. |
+| `jsonEscape()`      | Escapes a string so it can be put in the JSON. |
+| `checkAuth()`       | HTTP basic authentication with `ota_user` / `ota_pass`. |
 | `handleRoot()`      | Route `GET /`: sends the page. |
-| `handleSet()`       | Route `POST /set`: stores the hopper height (value strictly between 100 and 2000). |
-| `handleHostname()`  | Route `POST /hostname`: validates, stores in EEPROM and restarts to apply the new name. |
+| `handleStatus()`    | Route `GET /api/status`: returns the whole state as JSON. |
+| `handleSet()`       | Route `POST /set`: stores the hopper height (value strictly between 100 and 2000), in memory and in EEPROM. |
+| `handleHostname()`  | Route `POST /hostname`: validates, stores in EEPROM and restarts to apply the new name (does nothing if the name is unchanged). |
 | `handleReboot()`    | Route `POST /reboot`: restarts the ESP. |
-| `httpUpdater`       | Route `/update`: firmware update from the browser, protected by a user name and password. |
+| `handleAlignStart()`| Route `POST /align/start`: starts the alignment mode (see 3.6). |
+| `httpUpdater`       | Route `/update`: receives a firmware (`.bin`) from the page or the browser, protected by a user name and password. |
 
-The page has a first card with the latest measurements, then (since version 0.7) a **System information** card:
+The `/api/status` API returns: `temperature`, `consigne`, `state`, `distance`, `qte`, `hauteur`, `alignActive`, `alignRemain`, `alignDistance`, `alignStatus`, `ip`, `hostname`, `ssid`, `rssi`, `mac`, `mqtt`, `sensorOk`, `uptime`, `resetReason`, `heap`, `frag`, `version` and `build`.
 
-| Line                           | Content |
+The page is organized in cards:
+
+| Card                           | Content |
 |--------------------------------|---------|
-| Uptime                         | Time since the last startup (days, hours, minutes) |
-| Last reset reason              | `ESP.getResetReason()` |
-| Wi-Fi                          | Network name (SSID) and signal strength in dBm |
-| IP address, MAC address        | The ESP's addresses |
-| MQTT                           | "Connecte" (green) or "Deconnecte" (red) |
-| Capteur pellets (VL53L0X)      | "OK" (green) or "En defaut" (red), taken from `sensorOk` (updated every 60 s) |
-| Memoire libre                  | Free memory in KB, with heap fragmentation in % |
+| Poêle (stove)                  | Temperature, setpoint, stove state |
+| Pellets                        | Remaining quantity, measured height, hopper height form |
+| Alignement du capteur (sensor alignment) | Live distance, remaining time, measurement quality, duration choice (10, 30, 60 or 120 s), start button |
+| Système (system)               | IP address, hostname (`.local`), Wi-Fi and signal, MAC address, MQTT and pellet sensor (green or red dot), uptime, last reset reason, free memory and fragmentation, version and build date |
+| Configuration                  | Hostname form |
+| Mise à jour du firmware (OTA)  | `.bin` file choice and upload |
+| Maintenance                    | ESP restart |
 
-<img width="570" height="900" alt="image" src="https://github.com/user-attachments/assets/646224df-453b-48f2-a0ad-2de1de22bfef" />
+**Update from the page**: the page sends the `.bin` file (Sketch > Export compiled binary) with `POST /update` (field `update`), showing the progress in percent. Once installed, the ESP restarts and the page reloads after 20 s. Updating from the Arduino IDE (`ArduinoOTA`, protected by `ota_pass`) still works, and the `GET /update` page built into the library remains available.
+
+<!-- To do: replace the old screenshots with a capture of the version 0.11 interface. -->
 
 
 ### Hostname
@@ -384,6 +411,14 @@ The page has a first card with the latest measurements, then (since version 0.7)
 | `isValidHostname()`   | Checks 1 to 32 characters: letters, digits and hyphens, no hyphen at the start or the end. |
 | `loadHostname()`      | Reads the hostname from EEPROM, or takes the default value. |
 | `saveHostname()`      | Writes the hostname to EEPROM. |
+
+### Hopper height and alignment
+
+| Function            | Usage |
+|---------------------|-------|
+| `loadHauteur()`     | Reads the hopper height from EEPROM (bytes 40 to 42), or keeps the default value of 500 mm if it is missing or out of range. |
+| `saveHauteur()`     | Writes the height to EEPROM, only if it has changed. |
+| `alignTick()`       | Called on every pass of `loop()`: takes one measurement while the alignment mode is active, and stops it when the time is up (see 3.6). |
 
 ---
 
@@ -430,7 +465,7 @@ Every entity carries the same device description (the `device_information` macro
   "identifiers": ["42396f39-80d2-493b-8e8e-31a70e700bc6"],
   "model": "Micronova Controller",
   "name": "Micronova Controller",
-  "sw_version": "0.8"
+  "sw_version": "0.11"
 }
 ```
 
@@ -506,9 +541,9 @@ The **Adresse IP** entity (`homeassistant/sensor/Micronova/IP/config`) behaves d
 
 ## 6. Appendix: known issues
 
-These points come from reading the code. They are not fixed in version 0.8.
+These points come from reading the code. They are not fixed in version 0.11.
 
-1. **Hopper height is not kept.** `hauteur_cuve` goes back to 500 mm at every restart. The MQTT `H` command meant to restore it reads the value without assigning it, and only accepts 3-character messages.
+1. **MQTT `H` command does nothing.** Since version 0.10, the hopper height is kept in EEPROM and set from the web page. However, the MQTT `H` command (subscription to the `micronova/hauteur` topic) still reads the value without assigning it, and only accepts 3-character messages: the height cannot be changed over MQTT.
 2. **Possible crash on `P`.** A `P` message followed by a character other than 0 to 5 leaves a null pointer (`stovePW`) that is then used for the write.
 3. **Name of the "hauteur" sensor.** It is declared with the name `log`, like the log sensor: probably a copy-paste leftover.
 4. **Switch states.** The switch expects `ON` / `OFF` on `micronova/onoff` (`state_on` / `state_off`), while the firmware publishes `Marche`, `Eteint`, `Arrêt` or `Attente`. To check: HA may ignore these messages and not reflect the real state.
@@ -517,3 +552,22 @@ These points come from reading the code. They are not fixed in version 0.8.
 7. **No automatic restart if the sensor disappears from the I²C bus.** In that case, `getQte()` returns before the measurement and therefore adds no error to `count_reboot`: the restart after more than 10 failures no longer triggers. It remains active for out-of-range distances. The failure is reported to HA through `micronova/sensorstatus`.
 8. **Slow detection of out-of-range readings.** Since a measurement is only taken every 11 cycles, a sensor returning out-of-range values can take up to 11 minutes to be flagged as faulty. A disconnected sensor is detected in under a minute.
 9. **Uptime limited to about 49 days.** The uptime in the heartbeat and on the web page comes from `millis()`, which wraps to zero after about 49.7 days.
+10. **Alignment and the 60 s cycle.** During an alignment, the periodic cycle runs as usual (stove polling, about half a second of blocking): the live view briefly pauses.
+11. **Shared credentials, no encryption.** The web page, browser update and IDE OTA use the same `ota_user` / `ota_pass`. HTTP basic authentication travels in clear text on the local network (no HTTPS).
+
+---
+
+## 7. Version history
+
+| Version | Changes |
+|---------|---------|
+| 0.7     | MQTT heartbeat and pellet sensor state (`sensorstatus`), "System information" card on the web page |
+| 0.8     | IP address publication (`micronova/ip`, retained) and "Adresse IP" entity |
+| 0.9     | Sensor alignment mode: continuous measurements for 5 to 120 s, with live view |
+| 0.10    | Hopper height kept in EEPROM |
+| 0.11    | New web interface (static page and JSON API `/api/status`, actions without reload), firmware update from the page with progress, access protected by `ota_user` / `ota_pass`, alignment built into the main page |
+
+Migration notes:
+
+- Version 0.11 asks for a user name and a password to open the web page, whereas earlier versions did not. The old `GET /align` and `GET /align/status` routes (version 0.9) no longer exist: the alignment is driven from the main page.
+- When first moving to version 0.10 or later, the hopper height has to be entered once again (500 mm until a value is stored).
