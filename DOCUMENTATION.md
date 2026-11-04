@@ -372,7 +372,8 @@ La page comporte une première carte avec les dernières mesures, puis (depuis l
 | Capteur pellets (VL53L0X)      | « OK » (vert) ou « En defaut » (rouge), reprend `sensorOk` (mis à jour toutes les 60 s) |
 | Memoire libre                  | Mémoire disponible en ko, avec la fragmentation en % |
 
-<img width="570" height="900" alt="image" src="https://github.com/user-attachments/assets/9a9f33a1-c6d5-4b87-948b-292a15e6c8a0" />
+<img width="364" height="933" alt="image" src="https://github.com/user-attachments/assets/aef95930-5f5b-420f-be73-78ee44b9db54" />
+
 
 
 ### Hostname
