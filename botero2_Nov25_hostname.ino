@@ -1,5 +1,6 @@
 //Include libraries
     #include <ESP8266WiFi.h>
+    #include <DNSServer.h>             // portail captif (mode configuration)
     #include <PubSubClient.h>
     #include <SoftwareSerial.h>
     #include <Wire.h>    
@@ -9,25 +10,38 @@
     #include <ArduinoOTA.h>
     #include <ESP8266HTTPUpdateServer.h>
 
-//Identifiants prives (Wi-Fi, MQTT, OTA) : voir secrets.example.h
-    #include "secrets.h"
+//Plus aucun identifiant dans le code : Wi-Fi, MQTT, broches et mots de passe sont saisis sur la page de
+//configuration (point d'acces "Micronova-Setup" au premier demarrage) et conserves en EEPROM.
 
 //Version du firmware (a incrementer a chaque nouvelle version)
-    #define FW_VERSION "0.11"
+    #define FW_VERSION "0.13"
 
 
 //MQTT Variables
-    #define mqtt_port 1883
     #define mqtt_topic "micronova"
-    
-//ESP Pinout configuration
+    #define DEFAULT_MQTT_PORT 1883
+    #define MQTT_CLIENT_ID "ESPClient"
+
+//Brochage de l'ESP : numeros de GPIO, saisis sur la page de configuration et conserves en EEPROM.
+//Les valeurs ci-dessous sont celles du montage d'origine : elles servent de valeurs par defaut.
     SoftwareSerial StoveSerial;
     #define SERIAL_MODE SWSERIAL_8N2 //8 data bits, parity none, 2 stop bits
-    #define RX_PIN D3
-    #define TX_PIN D4
-    #define ENABLE_RX D2
-    #define SCL D1
-    #define SDA D6
+    #define DEFAULT_PIN_RX D3          // liaison poele, reception
+    #define DEFAULT_PIN_TX D4          // liaison poele, emission
+    #define DEFAULT_PIN_ENABLE_RX D2   // activation de la reception (optocoupleur)
+    #define DEFAULT_PIN_SDA D6         // I2C : capteur VL53L0X
+    #define DEFAULT_PIN_SCL D1
+    uint8_t pinRx = DEFAULT_PIN_RX;
+    uint8_t pinTx = DEFAULT_PIN_TX;
+    uint8_t pinEnableRx = DEFAULT_PIN_ENABLE_RX;
+    uint8_t pinSda = DEFAULT_PIN_SDA;
+    uint8_t pinScl = DEFAULT_PIN_SCL;
+
+//Point d'acces de configuration (premier demarrage, ou Wi-Fi injoignable)
+    #define AP_SSID "Micronova-Setup"
+    #define AP_PASS ""                            // vide = point d'acces ouvert ; sinon 8 caracteres minimum
+    #define WIFI_CONNECT_TIMEOUT_MS 30000UL       // delai de connexion au Wi-Fi saisi avant de rouvrir le point d'acces
+    #define PORTAL_RETRY_MS 300000UL              // point d'acces de repli : nouvel essai de connexion apres 5 min d'inactivite
 
 
 //Capteur de distance
@@ -40,7 +54,6 @@ bool hauteur_set = false;        // indique si modifiée via web
 //Hostname (valeur par defaut + stockage en EEPROM)
     #define DEFAULT_HOSTNAME "micronova"
     #define HOSTNAME_MAX_LEN 32
-    #define EEPROM_SIZE 64
     #define EEPROM_MAGIC 0xA5   // marqueur : un hostname valide est stocke en EEPROM
     String espHostname = DEFAULT_HOSTNAME;
 
@@ -49,7 +62,38 @@ bool hauteur_set = false;        // indique si modifiée via web
     #define HAUTEUR_ADDR 40
     #define HAUTEUR_MAGIC 0xB7
 
-//Mise a jour OTA (identifiants a changer !)
+//Configuration saisie sur la page web (Wi-Fi, MQTT, broches, identifiants web/OTA), stockee en EEPROM
+//apres la zone du hostname (octets 0 a 33) et de la hauteur de cuve (octets 40 a 42) : les valeurs deja
+//enregistrees par les versions precedentes sont conservees.
+    #define CFG_ADDR 64
+    #define CFG_MAGIC 0xC0F10012UL      // marqueur : une configuration est stockee en EEPROM
+    struct StoredCfg
+    {
+        uint32_t magic;
+        char ssid[33];
+        char pass[64];
+        char mqttHost[65];
+        uint16_t mqttPort;
+        char mqttUser[33];
+        char mqttPass[64];
+        uint8_t pinRx, pinTx, pinEnable, pinSda, pinScl;
+        char webUser[33];
+        char webPass[64];
+    };
+    #define EEPROM_SIZE (CFG_ADDR + sizeof(StoredCfg))
+
+    String cfgSsid, cfgPass;
+    String cfgMqttHost, cfgMqttUser, cfgMqttPass;
+    uint16_t cfgMqttPort = DEFAULT_MQTT_PORT;
+    String cfgWebUser = "admin", cfgWebPass;     // identifiants de la page web, de /update et de l'OTA
+    bool cfgConfigured = false;                  // une configuration complete est stockee en EEPROM
+
+//Mode configuration (point d'acces + page /config, sans MQTT ni dialogue avec le poele)
+    bool portalMode = false;
+    bool portalFirstSetup = false;               // true : aucune configuration stockee, donc aucun mot de passe a demander
+    unsigned long lastWebActivity = 0;
+    DNSServer dnsServer;
+    String scanCache = "[]";                     // derniere liste de reseaux Wi-Fi (JSON)
 
 //Un hostname valide : 1 a 32 caracteres, lettres/chiffres/tirets, sans tiret au debut ou a la fin
 bool isValidHostname(const String &name)
@@ -117,6 +161,99 @@ void saveHauteur(int valeur)
     EEPROM.commit();
 }
 
+//Broches utilisables : numeros de GPIO de D1 a D8 sur une carte NodeMCU / Wemos D1 mini.
+//GPIO16 (D0) est exclu : pas d'interruption, donc inutilisable pour la liaison serie logicielle ni pour l'I2C.
+bool isValidPin(int gpio)
+{
+    switch (gpio)
+    {
+        case 0: case 2: case 4: case 5: case 12: case 13: case 14: case 15: return true;
+        default: return false;
+    }
+}
+
+//Les cinq fonctions doivent utiliser cinq broches differentes
+bool pinsAreDistinct(int a, int b, int c, int d, int e)
+{
+    int p[5] = {a, b, c, d, e};
+    for (int i = 0; i < 5; i++)
+        for (int j = i + 1; j < 5; j++)
+            if (p[i] == p[j]) return false;
+    return true;
+}
+
+//Lit la configuration en EEPROM. cfgConfigured reste a false si aucune configuration complete n'est stockee.
+//Les valeurs par defaut (broches d'origine, port 1883) restent en place pour tout champ absent ou invalide.
+void loadConfig()
+{
+    StoredCfg sc;
+    EEPROM.get(CFG_ADDR, sc);
+    cfgConfigured = false;
+    if (sc.magic != CFG_MAGIC) return;
+
+    sc.ssid[sizeof(sc.ssid) - 1] = 0;
+    sc.pass[sizeof(sc.pass) - 1] = 0;
+    sc.mqttHost[sizeof(sc.mqttHost) - 1] = 0;
+    sc.mqttUser[sizeof(sc.mqttUser) - 1] = 0;
+    sc.mqttPass[sizeof(sc.mqttPass) - 1] = 0;
+    sc.webUser[sizeof(sc.webUser) - 1] = 0;
+    sc.webPass[sizeof(sc.webPass) - 1] = 0;
+
+    cfgSsid = sc.ssid;
+    cfgPass = sc.pass;
+    cfgMqttHost = sc.mqttHost;
+    cfgMqttUser = sc.mqttUser;
+    cfgMqttPass = sc.mqttPass;
+    cfgWebUser = sc.webUser;
+    cfgWebPass = sc.webPass;
+    if (sc.mqttPort > 0) cfgMqttPort = sc.mqttPort;
+
+    if (isValidPin(sc.pinRx) && isValidPin(sc.pinTx) && isValidPin(sc.pinEnable) && isValidPin(sc.pinSda) && isValidPin(sc.pinScl)
+        && pinsAreDistinct(sc.pinRx, sc.pinTx, sc.pinEnable, sc.pinSda, sc.pinScl))
+    {
+        pinRx = sc.pinRx;
+        pinTx = sc.pinTx;
+        pinEnableRx = sc.pinEnable;
+        pinSda = sc.pinSda;
+        pinScl = sc.pinScl;
+    }
+
+    cfgConfigured = cfgSsid.length() > 0 && cfgMqttHost.length() > 0 && cfgWebUser.length() > 0 && cfgWebPass.length() > 0;
+}
+
+//Enregistre la configuration en EEPROM (les variables cfg* ne sont pas modifiees : l'ESP redemarre ensuite)
+void saveConfig(const String &ssid, const String &pass, const String &mHost, uint16_t mPort, const String &mUser, const String &mPass, uint8_t rx, uint8_t tx, uint8_t en, uint8_t sda, uint8_t scl, const String &wUser, const String &wPass)
+{
+    StoredCfg sc;
+    memset(&sc, 0, sizeof(sc));
+    sc.magic = CFG_MAGIC;
+    strncpy(sc.ssid, ssid.c_str(), sizeof(sc.ssid) - 1);
+    strncpy(sc.pass, pass.c_str(), sizeof(sc.pass) - 1);
+    strncpy(sc.mqttHost, mHost.c_str(), sizeof(sc.mqttHost) - 1);
+    sc.mqttPort = mPort;
+    strncpy(sc.mqttUser, mUser.c_str(), sizeof(sc.mqttUser) - 1);
+    strncpy(sc.mqttPass, mPass.c_str(), sizeof(sc.mqttPass) - 1);
+    sc.pinRx = rx;
+    sc.pinTx = tx;
+    sc.pinEnable = en;
+    sc.pinSda = sda;
+    sc.pinScl = scl;
+    strncpy(sc.webUser, wUser.c_str(), sizeof(sc.webUser) - 1);
+    strncpy(sc.webPass, wPass.c_str(), sizeof(sc.webPass) - 1);
+
+    EEPROM.put(CFG_ADDR, sc);
+    EEPROM.commit();
+}
+
+//Efface la configuration : au prochain demarrage, l'ESP rouvre le portail de configuration initiale.
+//Le hostname et la hauteur de cuve ne sont pas touches (ils pre-remplissent le formulaire).
+void clearConfig()
+{
+    StoredCfg sc;
+    memset(&sc, 0xFF, sizeof(sc));
+    EEPROM.put(CFG_ADDR, sc);
+    EEPROM.commit();
+}
 WiFiClient espClient;
 PubSubClient client(espClient);
 
@@ -233,47 +370,35 @@ float lastQte = -1; // Variable globale pour mémoriser la dernière valeur publ
         Serial.println("[LOG] " + text);
     }
 
-//Setup WiFiManager and connect to WiFi
-    void setup_wifi() 
-    {        
-        Serial.println("");
-        Serial.println("Wifi : configuration");
-        delay(10);
-        WiFi.mode(WIFI_STA);
-        WiFi.hostname(espHostname);
-        WiFi.begin(ssid, password);
-        while (WiFi.status() != WL_CONNECTED) {
-            delay(500);
-        }
-        Serial.println("Wifi : connected");
-        Serial.print("Wifi : hostname: ");
-        Serial.println(espHostname);
-        Serial.print("Wifi : IP address: ");
-        Serial.println(WiFi.localIP());
-        mqttPublish(client, log_topic, WiFi.localIP().toString(), true);
-    }
-
-
-
-   
 //Connect to MQTT server
     void reconnect_mqtt() 
     {
         Write_Log(client, "MQTT : configuration");
         Serial.println();
-        client.setServer(mqtt_server, mqtt_port);
+        client.setServer(cfgMqttHost.c_str(), cfgMqttPort);
         client.setCallback(callback);
         //Loop until we're reconnected
         while (!client.connected())
         {
-            
-            if (client.connect("ESPClient", mqtt_user, mqtt_pass))
+            bool connected = (cfgMqttUser.length() > 0)
+                ? client.connect(MQTT_CLIENT_ID, cfgMqttUser.c_str(), cfgMqttPass.c_str())
+                : client.connect(MQTT_CLIENT_ID);   // broker sans authentification
+
+            if (connected)
             {
                 client.setBufferSize(1024);
             }
             else
             {
-                delay(5000);
+                Serial.println("[MQTT] Connexion impossible (code " + String(client.state()) + "), nouvel essai dans 5 s");
+                //Pendant l'attente, la page web reste disponible : on peut corriger la configuration MQTT
+                unsigned long waitStart = millis();
+                while (millis() - waitStart < 5000)
+                {
+                    webServer.handleClient();
+                    ArduinoOTA.handle();
+                    delay(10);
+                }
             }
         }
         if (client.connected())
@@ -602,7 +727,7 @@ void checkStoveReply()
         stoveRxData[rxCount] = StoveSerial.read();
         rxCount++;
     }
-    digitalWrite(ENABLE_RX, HIGH);
+    digitalWrite(pinEnableRx, HIGH);
     if (rxCount == 2)
     {
         byte val = stoveRxData[1];
@@ -846,7 +971,7 @@ void getStoveState() //Get detailed stove state
     StoveSerial.write(readByte);
     delay(1);
     StoveSerial.write(stoveStateAddr);
-    digitalWrite(ENABLE_RX, LOW);
+    digitalWrite(pinEnableRx, LOW);
     delay(80);
     checkStoveReply();
 }
@@ -857,7 +982,7 @@ void getAmbTemp() //Get room temperature
     StoveSerial.write(readByte);
     delay(1);
     StoveSerial.write(ambTempAddr);
-    digitalWrite(ENABLE_RX, LOW);
+    digitalWrite(pinEnableRx, LOW);
     delay(80);
     checkStoveReply();
 }
@@ -868,7 +993,7 @@ void getStovePower() //Get Puissance réelle
     StoveSerial.write(readByte);
     delay(1);
     StoveSerial.write(stovePwrAddr);
-    digitalWrite(ENABLE_RX, LOW);
+    digitalWrite(pinEnableRx, LOW);
     delay(80);
     checkStoveReply();
 }
@@ -879,7 +1004,7 @@ void getFumeTemp() //Get fume temperature
     StoveSerial.write(readByte);
     delay(1);
     StoveSerial.write(fumeTempAddr);
-    digitalWrite(ENABLE_RX, LOW);
+    digitalWrite(pinEnableRx, LOW);
     delay(80);
     checkStoveReply();
 }
@@ -890,7 +1015,7 @@ void getBlowTemp() //Get blow temperature
     StoveSerial.write(readByte);
     delay(1);
     StoveSerial.write(blowTempAddr);
-    digitalWrite(ENABLE_RX, LOW);
+    digitalWrite(pinEnableRx, LOW);
     delay(80);
     checkStoveReply();
 }
@@ -901,7 +1026,7 @@ void getCardTemp() //Get card temperature
     StoveSerial.write(readByte);
     delay(1);
     StoveSerial.write(cardTempAddr);
-    digitalWrite(ENABLE_RX, LOW);
+    digitalWrite(pinEnableRx, LOW);
     delay(80);
     checkStoveReply();
 }
@@ -912,7 +1037,7 @@ void getExtractor() //Get extractor speed
     StoveSerial.write(readByte);
     delay(1);
     StoveSerial.write(extractorAddr);
-    digitalWrite(ENABLE_RX, LOW);
+    digitalWrite(pinEnableRx, LOW);
     delay(80);
     checkStoveReply();
 }
@@ -923,7 +1048,7 @@ void getBlowSpeed() //Get blow speed
     StoveSerial.write(readByte);
     delay(1);
     StoveSerial.write(blowSpeedAddr);
-    digitalWrite(ENABLE_RX, LOW);
+    digitalWrite(pinEnableRx, LOW);
     delay(80);
     checkStoveReply();
 }
@@ -934,7 +1059,7 @@ void getVisPellet() //Get speed vis pellet
     StoveSerial.write(readByte);
     delay(1);
     StoveSerial.write(visPelletAddr);
-    digitalWrite(ENABLE_RX, LOW);
+    digitalWrite(pinEnableRx, LOW);
     delay(80);
     checkStoveReply();
 }
@@ -945,7 +1070,7 @@ void getFixVacuum() //Get speed vis pellet
     StoveSerial.write(readByte);
     delay(1);
     StoveSerial.write(fixVacuumAddr);
-    digitalWrite(ENABLE_RX, LOW);
+    digitalWrite(pinEnableRx, LOW);
     delay(80);
     checkStoveReply();
 }
@@ -956,7 +1081,7 @@ void getReadVacuum() //Get speed vis pellet
     StoveSerial.write(readByte);
     delay(1);
     StoveSerial.write(readVacuumAddr);
-    digitalWrite(ENABLE_RX, LOW);
+    digitalWrite(pinEnableRx, LOW);
     delay(80);
     checkStoveReply();
 }
@@ -967,7 +1092,7 @@ void getMultVacuum() //Get speed vis pellet
     StoveSerial.write(readByte);
     delay(1);
     StoveSerial.write(multVacuumAddr);
-    digitalWrite(ENABLE_RX, LOW);
+    digitalWrite(pinEnableRx, LOW);
     delay(80);
     checkStoveReply();
 }
@@ -978,7 +1103,7 @@ void getTempSet() //Get the thermostat setting
     StoveSerial.write(readByte);
     delay(1);
     StoveSerial.write(tempSetAddr);
-    digitalWrite(ENABLE_RX, LOW);
+    digitalWrite(pinEnableRx, LOW);
     delay(80);
     checkStoveReply();
 }
@@ -989,7 +1114,7 @@ void getPowerSet() //Get the Power setting
     StoveSerial.write(readByte);
     delay(1);
     StoveSerial.write(pwrSetAddr);
-    digitalWrite(ENABLE_RX, LOW);
+    digitalWrite(pinEnableRx, LOW);
     delay(80);
     checkStoveReply();
 }
@@ -1146,8 +1271,8 @@ void getStates() //Calls all the get…() functions
 
 //Interface web (inspiree de watermeter2mqtt) : page statique en PROGMEM + API JSON /api/status.
 //La page se rafraichit toute seule (toutes les 5 s, toutes les 0,5 s pendant l'alignement) et les actions
-//(hauteur, hostname, alignement, redemarrage, mise a jour OTA) passent par fetch/XHR sans recharger la page.
-//Toutes les pages sont protegees par les identifiants ota_user / ota_pass (secrets.h).
+//(hauteur, alignement, redemarrage, mise a jour OTA) passent par fetch/XHR sans recharger la page.
+//Toutes les pages sont protegees par les identifiants saisis a la configuration (utilisateur / mot de passe web).
 
 const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
@@ -1182,12 +1307,25 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   .dot.on { background:var(--ok); }
   .ok { color:var(--ok); } .ko { color:var(--ko); }
   .msg { margin-top:10px; font-size:.9rem; color:var(--mut); }
-  @media (max-width:480px) { .grid { grid-template-columns:1fr; } }
+  .msg.ko { color:var(--ko); }
+  button.sec { background:var(--bd); color:var(--txt); }
+  .two { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  .tabs { display:flex; gap:8px; margin:0 0 16px; }
+  .tab { flex:1; background:var(--card); color:var(--mut); border:1px solid var(--bd); }
+  .tab.on { background:var(--acc); color:#fff; border-color:var(--acc); }
+  @media (max-width:480px) { .grid, .two { grid-template-columns:1fr; } }
 </style>
 </head>
 <body>
 <main>
   <h1>🔥 Contrôleur poêle Micronova</h1>
+
+  <nav class="tabs" id="tabs">
+    <button type="button" class="tab on" id="tabdash">Tableau de bord</button>
+    <button type="button" class="tab" id="tabcfg">Configuration</button>
+  </nav>
+
+  <div id="pdash">
 
   <div class="card">
     <h2>Poêle</h2>
@@ -1249,16 +1387,6 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   </div>
 
   <div class="card">
-    <h2>Configuration</h2>
-    <form id="hostform">
-      <label for="hostIn">Hostname (lettres, chiffres, tirets)</label>
-      <input id="hostIn" name="hostname" pattern="[A-Za-z0-9\-]{1,32}" maxlength="32" required>
-      <div class="row"><button type="submit">Enregistrer et redémarrer</button></div>
-    </form>
-    <div class="msg" id="hostmsg"></div>
-  </div>
-
-  <div class="card">
     <h2>Mise à jour du firmware (OTA)</h2>
     <form id="fwForm">
       <label for="fwFile">Fichier .bin (Croquis > Exporter les binaires compilés)</label>
@@ -1276,6 +1404,79 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       <button class="danger" id="reboot">Redémarrer l'ESP</button>
     </div>
     <div class="msg" id="sysmsg"></div>
+  </div>
+  </div>
+
+  <div id="pcfg" style="display:none">
+    <p class="hint" id="c_intro"></p>
+
+    <form id="c_cfg" autocomplete="off">
+    <div class="card">
+      <h2>Wi-Fi</h2>
+      <label for="c_ssid">Réseau Wi-Fi (SSID)</label>
+      <input id="c_ssid" name="ssid" list="c_nets" maxlength="32" required>
+      <datalist id="c_nets"></datalist>
+      <label for="c_pass">Mot de passe Wi-Fi (8 à 63 caractères, vide si le réseau est ouvert)</label>
+      <input id="c_pass" name="pass" type="password" maxlength="63" autocomplete="new-password">
+      <label for="c_hostname">Hostname (lettres, chiffres, tirets)</label>
+      <input id="c_hostname" name="hostname" pattern="[A-Za-z0-9\-]{1,32}" maxlength="32" required>
+      <div class="row"><button type="button" class="sec" id="c_scan">Rechercher les réseaux</button></div>
+      <div class="msg" id="c_scanmsg"></div>
+    </div>
+
+    <div class="card">
+      <h2>Serveur MQTT</h2>
+      <div class="two">
+        <div><label for="c_mqttHost">Adresse du serveur</label><input id="c_mqttHost" name="mqttHost" maxlength="64" required></div>
+        <div><label for="c_mqttPort">Port</label><input id="c_mqttPort" name="mqttPort" type="number" min="1" max="65535" required></div>
+        <div><label for="c_mqttUser">Utilisateur (vide si aucun)</label><input id="c_mqttUser" name="mqttUser" maxlength="32" autocomplete="off"></div>
+        <div><label for="c_mqttPass">Mot de passe</label><input id="c_mqttPass" name="mqttPass" type="password" maxlength="63" autocomplete="new-password"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Broches</h2>
+      <p class="hint">Numéros D1 à D8 d'une carte NodeMCU ou Wemos D1 mini. Les valeurs par défaut sont celles du montage d'origine. Les broches D3, D4 et D8 (GPIO0, 2, 15) conditionnent le démarrage de l'ESP. Chaque fonction doit avoir sa propre broche.</p>
+      <div class="two">
+        <div><label for="c_pinRx">Liaison poêle : réception (RX)</label><select id="c_pinRx" name="pinRx"></select></div>
+        <div><label for="c_pinTx">Liaison poêle : émission (TX)</label><select id="c_pinTx" name="pinTx"></select></div>
+        <div><label for="c_pinEn">Activation de la réception (optocoupleur)</label><select id="c_pinEn" name="pinEn"></select></div>
+        <div></div>
+        <div><label for="c_pinSda">Capteur VL53L0X : SDA</label><select id="c_pinSda" name="pinSda"></select></div>
+        <div><label for="c_pinScl">Capteur VL53L0X : SCL</label><select id="c_pinScl" name="pinScl"></select></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Cuve à pellets</h2>
+      <label for="c_hauteur">Hauteur de la cuve (mm, de 101 à 1999)</label>
+      <input id="c_hauteur" name="hauteur" type="number" min="101" max="1999" required>
+    </div>
+
+    <div class="card">
+      <h2>Accès à cette page et mises à jour</h2>
+      <p class="hint">Ces identifiants protègent la page web, la mise à jour par navigateur (/update) et la mise à jour depuis l'IDE Arduino.</p>
+      <div class="two">
+        <div><label for="c_webUser">Utilisateur</label><input id="c_webUser" name="webUser" maxlength="32" required autocomplete="off"></div>
+        <div></div>
+        <div><label for="c_webPass">Mot de passe (6 caractères minimum)</label><input id="c_webPass" name="webPass" type="password" maxlength="63" autocomplete="new-password"></div>
+        <div><label for="c_webPass2">Confirmer le mot de passe</label><input id="c_webPass2" name="webPass2" type="password" maxlength="63" autocomplete="new-password"></div>
+      </div>
+    </div>
+
+    <div class="row">
+      <button type="submit" id="c_save">Enregistrer et redémarrer</button>
+      <button type="button" class="sec" id="c_cancel">Annuler</button>
+    </div>
+    <div class="msg" id="c_msg"></div>
+  </form>
+
+    <div class="card" id="c_resetcard" style="margin-top:16px">
+    <h2>Configuration initiale</h2>
+    <p class="hint">Efface le Wi-Fi, le serveur MQTT, les broches et les identifiants, puis redémarre en mode configuration (point d'accès « Micronova-Setup »).</p>
+    <button type="button" class="danger" id="c_reset">Revenir à la configuration initiale</button>
+    <div class="msg" id="c_resetmsg"></div>
+  </div>
   </div>
 </main>
 
@@ -1336,7 +1537,6 @@ async function refresh() {
     $('version').textContent = s.version + ' (' + s.build + ')';
     if (!formFilled) {
       $('hin').value = s.hauteur;
-      $('hostIn').value = s.hostname;
       formFilled = true;
     }
   } catch (e) { /* ESP injoignable (redémarrage ?) */ }
@@ -1355,15 +1555,6 @@ $('alstart').onclick = async () => {
   try { $('almsg').textContent = (await post('/align/start', { duree: $('aldur').value })).text; }
   catch (e) { $('almsg').textContent = 'Erreur lors de l\'envoi.'; }
   refresh();
-};
-
-$('hostform').onsubmit = async ev => {
-  ev.preventDefault();
-  try {
-    const r = await post('/hostname', { hostname: $('hostIn').value });
-    $('hostmsg').textContent = r.text;
-    if (r.ok && r.text.indexOf('Redémarrage') >= 0) setTimeout(() => location.reload(), 15000);
-  } catch (e) { $('hostmsg').textContent = 'Erreur lors de l\'envoi.'; }
 };
 
 $('fwForm').onsubmit = ev => {
@@ -1399,7 +1590,115 @@ $('reboot').onclick = async () => {
   setTimeout(() => location.reload(), 15000);
 };
 
-refresh();
+// ---------------- Onglets et configuration ----------------
+const PINS = [[5,'D1'],[4,'D2'],[0,'D3'],[2,'D4'],[14,'D5'],[12,'D6'],[13,'D7'],[15,'D8']];
+const PIN_FIELDS = ['c_pinRx','c_pinTx','c_pinEn','c_pinSda','c_pinScl'];
+let firstSetup = true;   // aucune configuration stockee : seul l'onglet Configuration est proposé
+let portal = false;      // point d'accès de configuration : pas de tableau de bord (poêle et MQTT inactifs)
+
+PIN_FIELDS.forEach(id => {
+  $(id).innerHTML = PINS.map(p => '<option value="' + p[0] + '">' + p[1] + ' (GPIO' + p[0] + ')</option>').join('');
+});
+
+function showTab(name) {
+  $('pdash').style.display = name === 'dash' ? '' : 'none';
+  $('pcfg').style.display  = name === 'cfg' ? '' : 'none';
+  $('tabdash').className = 'tab' + (name === 'dash' ? ' on' : '');
+  $('tabcfg').className  = 'tab' + (name === 'cfg' ? ' on' : '');
+}
+$('tabdash').onclick = () => showTab('dash');
+$('tabcfg').onclick  = () => showTab('cfg');
+
+function show(id, text, bad) {
+  $(id).textContent = text;
+  $(id).className = 'msg' + (bad ? ' ko' : '');
+}
+
+function fillNets(list) {
+  $('c_nets').innerHTML = list.map(n => '<option value="' + n.ssid.replace(/"/g, '&quot;') + '">' + n.rssi + ' dBm</option>').join('');
+  return list.length;
+}
+
+async function loadConfig() {
+  try {
+    const c = await (await fetch('/api/config')).json();
+    firstSetup = c.first;
+    portal = c.portal;
+    $('c_ssid').value = c.ssid;
+    $('c_hostname').value = c.hostname;
+    $('c_mqttHost').value = c.mqttHost;
+    $('c_mqttPort').value = c.mqttPort;
+    $('c_mqttUser').value = c.mqttUser;
+    $('c_pinRx').value = c.pinRx;
+    $('c_pinTx').value = c.pinTx;
+    $('c_pinEn').value = c.pinEn;
+    $('c_pinSda').value = c.pinSda;
+    $('c_pinScl').value = c.pinScl;
+    $('c_hauteur').value = c.hauteur;
+    $('c_webUser').value = c.webUser;
+    $('c_pass').value = '';  $('c_mqttPass').value = '';  $('c_webPass').value = '';  $('c_webPass2').value = '';
+    $('c_pass').placeholder = c.hasWifiPass ? '(inchangé)' : '';
+    $('c_mqttPass').placeholder = c.hasMqttPass ? '(inchangé)' : '';
+    $('c_webPass').placeholder = firstSetup ? '' : '(inchangé)';
+    $('c_webPass').required = firstSetup;
+    $('c_webPass2').required = firstSetup;
+    $('c_resetcard').style.display = firstSetup ? 'none' : '';
+    if (firstSetup) {
+      $('c_intro').textContent = 'Première configuration : renseignez le Wi-Fi, le serveur MQTT, les broches et la hauteur de la cuve. Après l\'enregistrement, l\'ESP redémarre et utilise ces valeurs.';
+    } else if (portal) {
+      $('c_intro').textContent = 'L\'ESP n\'a pas réussi à se connecter au Wi-Fi « ' + c.ssid + ' ». Vérifiez les réglages ci-dessous, puis enregistrez.';
+    } else {
+      $('c_intro').textContent = 'Les modifications sont appliquées après le redémarrage de l\'ESP. Un mot de passe laissé vide est conservé.';
+    }
+  } catch (e) { show('c_msg', 'Impossible de lire la configuration actuelle.', true); }
+}
+
+$('c_scan').onclick = async () => {
+  show('c_scanmsg', 'Recherche en cours… (la connexion peut être brièvement interrompue)');
+  try {
+    const n = fillNets(await (await fetch('/api/scan?refresh=1')).json());
+    show('c_scanmsg', n + ' réseau(x) trouvé(s). Videz le champ « Réseau Wi-Fi » puis cliquez dedans pour afficher la liste.');
+  } catch (e) { show('c_scanmsg', 'Échec de la recherche.', true); }
+};
+
+$('c_cancel').onclick = () => { show('c_msg', ''); loadConfig(); };
+
+$('c_cfg').onsubmit = async ev => {
+  ev.preventDefault();
+  if ($('c_webPass').value !== $('c_webPass2').value) { show('c_msg', 'Les deux mots de passe web ne sont pas identiques.', true); return; }
+  if (new Set(PIN_FIELDS.map(id => $(id).value)).size !== PIN_FIELDS.length) { show('c_msg', 'Chaque fonction doit utiliser une broche différente.', true); return; }
+  const body = new URLSearchParams(new FormData($('c_cfg')));
+  body.delete('webPass2');
+  $('c_save').disabled = true;
+  try {
+    const r = await fetch('/api/config', { method:'POST', body });
+    show('c_msg', await r.text(), !r.ok);
+    if (r.ok) { if (!portal) setTimeout(() => location.href = '/', 15000); }
+    else $('c_save').disabled = false;
+  } catch (e) { show('c_msg', 'Connexion perdue : l\'ESP est probablement en train de redémarrer.'); }
+};
+
+$('c_reset').onclick = async () => {
+  if (!confirm('Effacer la configuration (Wi-Fi, MQTT, broches, identifiants) et redémarrer en mode configuration ?')) return;
+  try { show('c_resetmsg', await (await fetch('/config/reset', { method:'POST' })).text()); }
+  catch (e) { show('c_resetmsg', 'Redémarrage en cours…'); }
+};
+
+async function init() {
+  await loadConfig();
+  if (portal) {
+    // point d'accès de configuration : uniquement l'onglet Configuration
+    $('tabs').style.display = 'none';
+    showTab('cfg');
+    try { fillNets(await (await fetch('/api/scan')).json()); } catch (e) {}
+    setInterval(() => { fetch('/api/config').catch(() => {}); }, 60000);   // evite le nouvel essai automatique pendant la saisie
+  } else {
+    showTab(location.pathname === '/config' || location.hash === '#config' ? 'cfg' : 'dash');
+    refresh();   // pas de recherche de reseaux automatique ici : elle perturbe brievement le Wi-Fi (bouton « Rechercher »)
+  }
+}
+
+init();
 </script>
 </body>
 </html>
@@ -1421,15 +1720,26 @@ String jsonEscape(const String &in)
     return out;
 }
 
-//Authentification HTTP basique (memes identifiants que la mise a jour OTA)
+//Authentification HTTP basique : identifiants saisis a la configuration (les memes pour la page, /update et l'OTA).
+//Pendant la premiere configuration, aucun identifiant n'existe encore : seule la page de configuration est servie, sans mot de passe.
 bool checkAuth()
 {
-    if (!webServer.authenticate(ota_user, ota_pass))
+    lastWebActivity = millis();
+    if (portalFirstSetup) return true;
+    if (!webServer.authenticate(cfgWebUser.c_str(), cfgWebPass.c_str()))
     {
         webServer.requestAuthentication();
         return false;
     }
     return true;
+}
+
+//Redirige vers la page de configuration (portail captif : toute adresse tapee renvoie ici)
+void redirectToConfig()
+{
+    lastWebActivity = millis();
+    webServer.sendHeader("Location", "http://" + WiFi.softAPIP().toString() + "/config", true);
+    webServer.send(302, "text/plain", "");
 }
 
 //Handlers HTTP
@@ -1499,36 +1809,6 @@ void handleSet()
     }
 }
 
-//POST /hostname : nouveau hostname (EEPROM), applique au redemarrage
-void handleHostname()
-{
-    if (!checkAuth()) return;
-    Serial.println("HTTP hostname appele");
-
-    String newHostname = webServer.arg("hostname");
-    newHostname.trim();
-
-    if (!isValidHostname(newHostname))
-    {
-        webServer.send(400, "text/plain; charset=utf-8", "Hostname invalide (lettres, chiffres et tirets, 32 max).");
-        return;
-    }
-
-    if (newHostname == espHostname)
-    {
-        webServer.send(200, "text/plain; charset=utf-8", "Hostname inchangé.");
-        return;
-    }
-
-    saveHostname(newHostname);
-    Write_Log(client, "WEB : hostname modifie = " + newHostname + " (redemarrage)");
-
-    webServer.send(200, "text/plain; charset=utf-8",
-        "Hostname enregistré. Redémarrage… reconnectez-vous sur http://" + newHostname + ".local");
-    delay(500);   // laisse le temps d'envoyer la reponse
-    ESP.restart();
-}
-
 //POST /reboot
 void handleReboot()
 {
@@ -1565,32 +1845,273 @@ void handleAlignStart()
     webServer.send(200, "text/plain; charset=utf-8", "Alignement lancé pour " + String(duree) + " s.");
 }
 
+//==================== CONFIGURATION (onglet « Configuration » de la page principale) ====================
+//Premier demarrage (aucune configuration en EEPROM) : l'ESP ouvre le point d'acces Wi-Fi "Micronova-Setup" et
+//sert la meme page, limitee a l'onglet Configuration (sans mot de passe, puisqu'aucun n'existe encore). Apres
+//l'enregistrement, il redemarre et utilise les valeurs saisies. Si la connexion au Wi-Fi saisi echoue, le point
+//d'acces reapparait (page protegee par le mot de passe web) et l'ESP retente la connexion apres 5 min d'inactivite.
+//Une fois connecte, le meme formulaire est disponible dans l'onglet Configuration (/config ouvre directement cet onglet).
+
+//Hors mode configuration : 404 ; en mode configuration : tout renvoie vers la page (portail captif)
+void handleNotFound()
+{
+    if (portalMode)
+    {
+        redirectToConfig();
+        return;
+    }
+    webServer.send(404, "text/plain", "Not found");
+}
+
+//Cherche les reseaux Wi-Fi et renvoie la liste en JSON (SSID masques ignores)
+String scanNetworksJson()
+{
+    int n = WiFi.scanNetworks();
+    String j = "[";
+    bool first = true;
+    for (int i = 0; i < n; i++)
+    {
+        if (WiFi.SSID(i).length() == 0) continue;
+        if (!first) j += ",";
+        first = false;
+        j += "{\"ssid\":\"" + jsonEscape(WiFi.SSID(i)) + "\",\"rssi\":" + String(WiFi.RSSI(i)) + "}";
+    }
+    j += "]";
+    WiFi.scanDelete();
+    return j;
+}
+
+//GET /api/scan : liste des reseaux (celle du demarrage ; ?refresh=1 relance une recherche)
+void handleScan()
+{
+    if (!checkAuth()) return;
+    if (webServer.hasArg("refresh") || scanCache.length() < 3) scanCache = scanNetworksJson();
+    webServer.sendHeader("Cache-Control", "no-store");
+    webServer.send(200, "application/json", scanCache);
+}
+
+//GET /config : meme page que /, ouverte sur l'onglet Configuration
+void handleConfigPage()
+{
+    if (!checkAuth()) return;
+    webServer.send_P(200, "text/html; charset=utf-8", INDEX_HTML);
+}
+
+//GET /api/config : valeurs actuelles (les mots de passe ne sont jamais renvoyes)
+void handleConfigGet()
+{
+    if (!checkAuth()) return;
+
+    String j = "{";
+    j += "\"first\":" + String(portalFirstSetup ? "true" : "false");
+    j += ",\"portal\":" + String(portalMode ? "true" : "false");
+    j += ",\"wifiFailed\":" + String((portalMode && !portalFirstSetup) ? "true" : "false");
+    j += ",\"ssid\":\"" + jsonEscape(cfgSsid) + "\"";
+    j += ",\"hostname\":\"" + jsonEscape(espHostname) + "\"";
+    j += ",\"hasWifiPass\":" + String(cfgPass.length() > 0 ? "true" : "false");
+    j += ",\"mqttHost\":\"" + jsonEscape(cfgMqttHost) + "\"";
+    j += ",\"mqttPort\":" + String(cfgMqttPort);
+    j += ",\"mqttUser\":\"" + jsonEscape(cfgMqttUser) + "\"";
+    j += ",\"hasMqttPass\":" + String(cfgMqttPass.length() > 0 ? "true" : "false");
+    j += ",\"pinRx\":" + String(pinRx);
+    j += ",\"pinTx\":" + String(pinTx);
+    j += ",\"pinEn\":" + String(pinEnableRx);
+    j += ",\"pinSda\":" + String(pinSda);
+    j += ",\"pinScl\":" + String(pinScl);
+    j += ",\"hauteur\":" + String(hauteur_cuve);
+    j += ",\"webUser\":\"" + jsonEscape(cfgWebUser) + "\"";
+    j += "}";
+
+    webServer.sendHeader("Cache-Control", "no-store");
+    webServer.send(200, "application/json", j);
+}
+
+//POST /api/config : valide, enregistre en EEPROM puis redemarre pour appliquer
+void handleConfigSave()
+{
+    if (!checkAuth()) return;
+    Serial.println("HTTP config appele");
+
+    String ssid = webServer.arg("ssid");        ssid.trim();
+    String pass = webServer.arg("pass");
+    String host = webServer.arg("hostname");    host.trim();
+    String mHost = webServer.arg("mqttHost");   mHost.trim();
+    long mPort = webServer.arg("mqttPort").toInt();
+    String mUser = webServer.arg("mqttUser");   mUser.trim();
+    String mPass = webServer.arg("mqttPass");
+    int pRx = webServer.arg("pinRx").toInt();
+    int pTx = webServer.arg("pinTx").toInt();
+    int pEn = webServer.arg("pinEn").toInt();
+    int pSda = webServer.arg("pinSda").toInt();
+    int pScl = webServer.arg("pinScl").toInt();
+    int hauteur = webServer.arg("hauteur").toInt();
+    String wUser = webServer.arg("webUser");    wUser.trim();
+    String wPass = webServer.arg("webPass");
+
+    //Champ de mot de passe laisse vide : on garde l'ancien (tant que le reseau / l'utilisateur ne change pas)
+    if (cfgConfigured)
+    {
+        if (pass.length() == 0 && ssid == cfgSsid) pass = cfgPass;
+        if (mPass.length() == 0 && mUser == cfgMqttUser) mPass = cfgMqttPass;
+        if (wPass.length() == 0) wPass = cfgWebPass;
+    }
+
+    String err = "";
+    if (ssid.length() < 1 || ssid.length() > 32) err = "Nom de réseau Wi-Fi invalide (1 à 32 caractères).";
+    else if (pass.length() > 63 || (pass.length() > 0 && pass.length() < 8)) err = "Mot de passe Wi-Fi invalide (8 à 63 caractères, ou vide pour un réseau ouvert).";
+    else if (!isValidHostname(host)) err = "Hostname invalide (lettres, chiffres et tirets, 32 max).";
+    else if (mHost.length() < 1 || mHost.length() > 64 || mHost.indexOf(' ') >= 0 || mHost.indexOf('/') >= 0) err = "Adresse du serveur MQTT invalide.";
+    else if (mPort < 1 || mPort > 65535) err = "Port MQTT invalide (1 à 65535).";
+    else if (mUser.length() > 32 || mPass.length() > 63) err = "Identifiants MQTT trop longs.";
+    else if (!isValidPin(pRx) || !isValidPin(pTx) || !isValidPin(pEn) || !isValidPin(pSda) || !isValidPin(pScl)) err = "Broche invalide.";
+    else if (!pinsAreDistinct(pRx, pTx, pEn, pSda, pScl)) err = "Chaque fonction doit utiliser une broche différente.";
+    else if (hauteur < 101 || hauteur > 1999) err = "Hauteur de cuve invalide (101 à 1999 mm).";
+    else if (wUser.length() < 1 || wUser.length() > 32 || wUser.indexOf(':') >= 0) err = "Utilisateur web invalide (1 à 32 caractères, sans « : »).";
+    else if (wPass.length() < 6 || wPass.length() > 63) err = "Mot de passe web invalide (6 à 63 caractères).";
+
+    if (err.length() > 0)
+    {
+        webServer.send(400, "text/plain; charset=utf-8", err);
+        return;
+    }
+
+    saveConfig(ssid, pass, mHost, (uint16_t)mPort, mUser, mPass, pRx, pTx, pEn, pSda, pScl, wUser, wPass);
+    saveHostname(host);
+    saveHauteur(hauteur);
+    Serial.println("Configuration enregistree, redemarrage");
+
+    webServer.send(200, "text/plain; charset=utf-8",
+        "Configuration enregistrée. L'ESP redémarre : reconnectez votre appareil à votre réseau Wi-Fi, puis ouvrez http://" + host +
+        ".local (ou l'adresse IP de l'ESP, visible dans votre routeur ou dans Home Assistant). Si la connexion échoue, le point d'accès « " AP_SSID " » réapparaît.");
+    delay(500);   // laisse le temps d'envoyer la reponse
+    ESP.restart();
+}
+
+//POST /config/reset : efface la configuration et redemarre en mode configuration initiale
+void handleConfigReset()
+{
+    if (!checkAuth()) return;
+    Serial.println("HTTP config/reset appele");
+    clearConfig();
+    webServer.send(200, "text/plain; charset=utf-8", "Configuration effacée. Redémarrage en mode configuration : connectez-vous au Wi-Fi « " AP_SSID " ».");
+    delay(500);   // laisse le temps d'envoyer la reponse
+    ESP.restart();
+}
+
+//Declare les routes web. En mode configuration, seules les routes de configuration sont actives.
+void setupWebServer()
+{
+    webServer.on("/", HTTP_GET, handleRoot);
+    webServer.on("/config", HTTP_GET, handleConfigPage);
+    webServer.on("/api/config", HTTP_GET, handleConfigGet);
+    webServer.on("/api/config", HTTP_POST, handleConfigSave);
+    webServer.on("/api/scan", HTTP_GET, handleScan);
+    webServer.on("/config/reset", HTTP_POST, handleConfigReset);
+    webServer.onNotFound(handleNotFound);
+
+    if (!portalMode)
+    {
+        webServer.on("/api/status", HTTP_GET, handleStatus);
+        webServer.on("/set", HTTP_POST, handleSet);
+        webServer.on("/reboot", HTTP_POST, handleReboot);
+        webServer.on("/align/start", HTTP_POST, handleAlignStart);
+        httpUpdater.setup(&webServer, "/update", cfgWebUser.c_str(), cfgWebPass.c_str());
+    }
+    webServer.begin();
+}
+
+//Connexion au Wi-Fi saisi dans la configuration. Renvoie false si la connexion n'aboutit pas dans le delai.
+bool connectWifi()
+{
+    Serial.println("");
+    Serial.println("Wifi : connexion a " + cfgSsid);
+    WiFi.persistent(false);   // les identifiants viennent de notre EEPROM : pas d'ecriture inutile dans la flash du SDK
+    WiFi.mode(WIFI_STA);
+    WiFi.hostname(espHostname);
+    WiFi.setAutoReconnect(true);
+    WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
+
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_CONNECT_TIMEOUT_MS)
+    {
+        delay(250);
+    }
+    if (WiFi.status() != WL_CONNECTED) return false;
+
+    Serial.println("Wifi : connected");
+    Serial.print("Wifi : hostname: ");
+    Serial.println(espHostname);
+    Serial.print("Wifi : IP address: ");
+    Serial.println(WiFi.localIP());
+    return true;
+}
+
+//Ouvre le point d'acces de configuration et la page /config (portail captif).
+//firstSetup = true : aucune configuration stockee. false : configuration presente mais Wi-Fi injoignable.
+void startPortal(bool firstSetup)
+{
+    portalMode = true;
+    portalFirstSetup = firstSetup;
+    lastWebActivity = millis();
+
+    WiFi.persistent(false);
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    delay(100);
+    scanCache = scanNetworksJson();   // avant d'ouvrir le point d'acces : une recherche en mode AP coupe les connexions
+
+    WiFi.mode(WIFI_AP_STA);
+    if (strlen(AP_PASS) >= 8) WiFi.softAP(AP_SSID, AP_PASS);
+    else WiFi.softAP(AP_SSID);
+    delay(200);
+
+    dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
+    dnsServer.start(53, "*", WiFi.softAPIP());   // toute adresse tapee renvoie vers l'ESP
+
+    setupWebServer();
+
+    Serial.print("Portail de configuration : Wi-Fi \"" AP_SSID "\", page http://");
+    Serial.print(WiFi.softAPIP());
+    Serial.println("/config");
+}
+
 void setup()
 {
-    //delay(10e3);
-    pinMode(ENABLE_RX, OUTPUT);
-    //Init Serial Communication
-    digitalWrite(ENABLE_RX, HIGH); //The led of the optocoupler is off
     Serial.begin(115200);
-    StoveSerial.begin(1200, SERIAL_MODE, RX_PIN, TX_PIN, false, 256);
+    Serial.println();
+    Serial.println("Micronova controller - firmware " FW_VERSION);
 
-    //Init Wifi
+    //Configuration : hostname, hauteur de cuve et reglages saisis sur la page web
     loadHostname();   // appelle EEPROM.begin()
     loadHauteur();
-    setup_wifi();
+    loadConfig();
 
-    webServer.on("/", HTTP_GET, handleRoot);
-    webServer.on("/api/status", HTTP_GET, handleStatus);
-    webServer.on("/set", HTTP_POST, handleSet);
-    webServer.on("/hostname", HTTP_POST, handleHostname);
-    webServer.on("/reboot", HTTP_POST, handleReboot);
-    webServer.on("/align/start", HTTP_POST, handleAlignStart);
-    httpUpdater.setup(&webServer, "/update", ota_user, ota_pass);
-    webServer.begin();
+    if (!cfgConfigured)
+    {
+        //Premier demarrage : point d'acces "Micronova-Setup" + page de configuration
+        Serial.println("Aucune configuration enregistree : demarrage du portail de configuration");
+        startPortal(true);
+        return;
+    }
+
+    //Broches : liaison poele et optocoupleur
+    pinMode(pinEnableRx, OUTPUT);
+    digitalWrite(pinEnableRx, HIGH); //The led of the optocoupler is off
+    StoveSerial.begin(1200, SERIAL_MODE, pinRx, pinTx, false, 256);
+
+    //Init Wifi
+    if (!connectWifi())
+    {
+        Serial.println("Wifi : connexion impossible, ouverture du point d'acces de configuration");
+        startPortal(false);
+        return;
+    }
+
+    setupWebServer();
 
     // OTA depuis l'IDE Arduino / PlatformIO
     ArduinoOTA.setHostname(espHostname.c_str());
-    ArduinoOTA.setPassword(ota_pass);
+    ArduinoOTA.setPassword(cfgWebPass.c_str());
     ArduinoOTA.onStart([]() { Write_Log(client, "OTA : debut de la mise a jour"); });
     ArduinoOTA.onEnd([]() { Write_Log(client, "OTA : termine, redemarrage"); });
     ArduinoOTA.onError([](ota_error_t error) { Write_Log(client, "OTA : erreur " + String((int)error)); });
@@ -1598,19 +2119,11 @@ void setup()
 
     Write_Log(client, "WEB : Serveur HTTP démarré");
 
-                                                                                                    //Init MQTT
-                                                                                                    /*
-                                                                                                    client.setServer(mqtt_server, mqtt_port);
-                                                                                                    client.setCallback(callback);
-                                                                                                    client.connect("ESPClient", mqtt_user,mqtt_pass);
-                                                                                                    client.subscribe(cmd_topic);
-                                                                                                    */
-    
-    
+    //Init MQTT (si le serveur est injoignable, la page web reste disponible pour corriger la configuration)
     reconnect_mqtt();
     client.subscribe(cmd_topic);
     client.subscribe(hauteur_topic); // abonner au topic hauteur
-    
+
 
     // Petit délai pour recevoir le dernier message MQTT sur hauteur
     unsigned long start = millis();
@@ -1619,16 +2132,17 @@ void setup()
     }
 
     //Write logs
-    
-    Write_Log(client,"Setup : Version " FW_VERSION " (" __DATE__ " " __TIME__ ")");
-    Write_Log(client,"Setup : Wifi ok");        
-    Write_Log(client,"Setup : MQTT ok");        
-    
 
-    //Init VL53L0X sensor  
-    
-    Wire.begin(SDA, SCL);   // SDA = D6, SCL = D1
-    Wire.setClock(100000);    
+    Write_Log(client,"Setup : Version " FW_VERSION " (" __DATE__ " " __TIME__ ")");
+    Write_Log(client,"Setup : Wifi ok");
+    Write_Log(client,"Setup : MQTT ok");
+    Write_Log(client,"Setup : broches GPIO RX=" + String(pinRx) + " TX=" + String(pinTx) + " ENABLE_RX=" + String(pinEnableRx) + " SDA=" + String(pinSda) + " SCL=" + String(pinScl));
+
+
+    //Init VL53L0X sensor
+
+    Wire.begin(pinSda, pinScl);
+    Wire.setClock(100000);
     sensorInitialized = lox.begin();
     if (!sensorInitialized) {
         Write_Log(client,"Setup VL53L0X : KO");
@@ -1639,7 +2153,7 @@ void setup()
     }
 
     count_reboot=0;
-    Write_Log(client,"Setup count_reboot=0"); 
+    Write_Log(client,"Setup count_reboot=0");
 
     measure_sleep=0;
     Write_Log(client,"Setup MeasureSleep=0");
@@ -1647,12 +2161,26 @@ void setup()
     // Premier heartbeat immediat (sans attendre 60 s)
     updateSensorHealth();
     publishHeartbeat();
-      
-}
 
+}
 
 void loop()
 {
+    //Mode configuration : seuls le DNS (portail captif) et la page web tournent
+    if (portalMode)
+    {
+        dnsServer.processNextRequest();
+        webServer.handleClient();
+
+        //Configuration presente mais Wi-Fi injoignable (box encore en demarrage apres une coupure ?) :
+        //nouvel essai de connexion apres 5 min sans activite sur la page
+        if (!portalFirstSetup && millis() - lastWebActivity > PORTAL_RETRY_MS)
+        {
+            Serial.println("Portail : nouvel essai de connexion au Wi-Fi");
+            ESP.restart();
+        }
+        return;
+    }
     
     
     if (!client.connected())
