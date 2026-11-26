@@ -1,6 +1,6 @@
 # Contrôleur Micronova (ESP8266) — Documentation technique
 
-Document rédigé d'après le code du firmware **version 0.13** (`botero2_Nov25_hostname.ino`).
+Document rédigé d'après le code du firmware **version 0.14** (`botero2_Nov25_hostname.ino`).
 
 ## Sommaire
 
@@ -26,7 +26,7 @@ Ce firmware transforme un ESP8266 en passerelle entre un **poêle à pellets éq
 - aider à positionner ce capteur dans la cuve (mode alignement : infrarouge émis en continu, distance affichée en direct) ;
 - signaler à HA qu'il est en vie et que le capteur de pellets fonctionne (heartbeat MQTT), pour détecter une panne, et lui communiquer son adresse IP ;
 - déclarer automatiquement tous les capteurs et commandes dans HA (MQTT discovery) ;
-- se configurer sans toucher au code : au premier démarrage, une page web (point d'accès Wi-Fi « Micronova-Setup ») permet de saisir le Wi-Fi, le serveur MQTT, les broches, la hauteur de cuve et les identifiants web, puis l'ESP redémarre avec ces valeurs ;
+- se configurer sans toucher au code : au premier démarrage, une page web (point d'accès Wi-Fi « Micronova-Setup ») permet de saisir le Wi-Fi, le serveur MQTT, les broches, la hauteur de cuve et, facultativement, un compte d'accès à la page web, puis l'ESP redémarre avec ces valeurs ;
 - se modifier ensuite depuis la même interface (onglet Configuration) et se mettre à jour sans câble (page web, OTA).
 
 ### Architecture
@@ -315,11 +315,13 @@ L'EEPROM (432 octets réservés) conserve le hostname, la hauteur de la cuve et,
 | 40      | Marqueur `0xB7` (une hauteur de cuve est stockée)                    |
 | 41      | Hauteur de la cuve en mm, octet de poids faible                      |
 | 42      | Hauteur de la cuve en mm, octet de poids fort                        |
-| 64 à 431 | Configuration (structure `StoredCfg`, marqueur `0xC0F10012`) : Wi-Fi (réseau, mot de passe), serveur MQTT (adresse, port, utilisateur, mot de passe), les cinq broches (numéros de GPIO), utilisateur et mot de passe web |
+| 64 à 431 | Configuration (structure `StoredCfg`, marqueur `0xC0F10012`) : Wi-Fi (réseau, mot de passe), serveur MQTT (adresse, port, utilisateur, mot de passe), les cinq broches (numéros de GPIO), utilisateur et mot de passe web (facultatifs : vides si l'accès à la page est libre) |
 
 Sans marqueur valide, ou si le contenu n'est pas un hostname correct, c'est la valeur par défaut `micronova` qui est utilisée. De même, sans marqueur `0xB7` valide, ou si la hauteur n'est pas comprise entre 101 et 1999 mm, la valeur par défaut de 500 mm est conservée. La hauteur n'est écrite que si elle a changé, pour ménager la flash.
 
-Sans marqueur `0xC0F10012`, ou si le Wi-Fi, l'adresse MQTT, l'utilisateur web ou son mot de passe manquent, l'ESP considère qu'il n'est pas configuré et ouvre le portail de configuration. Une broche invalide ou en double dans la structure est ignorée : les broches d'origine restent utilisées.
+Sans marqueur `0xC0F10012`, ou si le Wi-Fi ou l'adresse MQTT manquent, l'ESP considère qu'il n'est pas configuré et ouvre le portail de configuration. Une broche invalide ou en double dans la structure est ignorée : les broches d'origine restent utilisées.
+
+Le compte web est **facultatif** : sans mot de passe web enregistré (`webAuthEnabled()` faux), la page, `/update` et l'OTA sont en accès libre. Les configurations de la version 0.13, qui contiennent toujours un compte, restent valables telles quelles.
 
 Les mots de passe sont stockés **en clair** dans la flash de l'ESP.
 
@@ -337,14 +339,14 @@ Depuis la version 0.9, la page web propose un mode alignement pour positionner l
 
 ### 3.7 Première configuration et configuration ultérieure
 
-Depuis la version 0.12, aucun réglage n'est écrit dans le code : le Wi-Fi, le serveur MQTT, les broches, la hauteur de cuve et les identifiants web sont saisis sur la page de configuration et conservés en EEPROM (voir 3.5).
+Depuis la version 0.12, aucun réglage n'est écrit dans le code : le Wi-Fi, le serveur MQTT, les broches, la hauteur de cuve et le compte web (facultatif) sont saisis sur la page de configuration et conservés en EEPROM (voir 3.5).
 
 **Premier démarrage (aucune configuration enregistrée)**
 
 1. `setup()` constate l'absence de configuration (`cfgConfigured` faux) et appelle `startPortal(true)`.
 2. L'ESP cherche les réseaux Wi-Fi à portée (liste mise en cache), puis ouvre le point d'accès **`Micronova-Setup`**, ouvert par défaut (constantes `AP_SSID` et `AP_PASS`). Un serveur DNS renvoie toute adresse vers l'ESP (portail captif) : sur un téléphone, la page s'ouvre d'elle-même, sinon à l'adresse `http://192.168.4.1`.
-3. Le serveur web ne sert que la page, limitée à l'onglet Configuration, et les routes de configuration, **sans mot de passe** puisqu'aucun n'existe encore. Le poêle, le capteur, le MQTT et l'OTA ne sont pas démarrés, et les broches ne sont pas touchées.
-4. Le formulaire est pré-rempli : broches d'origine, port MQTT 1883, hauteur de cuve 500 mm (ou la valeur déjà stockée), hostname déjà stocké ou `micronova`, utilisateur web `admin`.
+3. Le serveur web ne sert que la page, limitée à l'onglet Configuration, et les routes de configuration, **sans mot de passe** puisqu'aucun n'existe encore (le compte web se choisit dans ce même formulaire). Le poêle, le capteur, le MQTT et l'OTA ne sont pas démarrés, et les broches ne sont pas touchées.
+4. Le formulaire est pré-rempli : broches d'origine, port MQTT 1883, hauteur de cuve 500 mm (ou la valeur déjà stockée), hostname déjà stocké ou `micronova`, utilisateur web `admin`. La case « Protéger l'accès par un identifiant et un mot de passe » est **cochée par défaut** ; décochée, les champs du compte disparaissent et une confirmation est demandée à l'enregistrement.
 5. `POST /api/config` valide les valeurs, les enregistre, puis redémarre l'ESP au bout d'une demi-seconde. Au démarrage suivant, `loadConfig()` relit ces valeurs et l'ESP fonctionne normalement.
 
 **Règles de validation**
@@ -359,14 +361,14 @@ Depuis la version 0.12, aucun réglage n'est écrit dans le code : le Wi-Fi, le 
 | Utilisateur, mot de passe MQTT  | 32 et 63 caractères au plus. Utilisateur vide : connexion sans authentification |
 | Broches                         | D1 à D8 (GPIO 0, 2, 4, 5, 12, 13, 14, 15), cinq broches différentes |
 | Hauteur de cuve                 | 101 à 1999 mm |
-| Utilisateur web                 | 1 à 32 caractères, sans « : » |
-| Mot de passe web                | 6 à 63 caractères |
+| Utilisateur web                 | Seulement si l'accès est protégé : 1 à 32 caractères, sans « : » |
+| Mot de passe web                | Seulement si l'accès est protégé : 6 à 63 caractères |
 
-Quand la configuration est déjà enregistrée, un mot de passe laissé vide est **conservé** : le mot de passe web toujours, celui du Wi-Fi tant que le réseau ne change pas, celui du MQTT tant que l'utilisateur ne change pas. Les mots de passe ne sont jamais renvoyés à la page (le formulaire affiche « (inchangé) »).
+Quand la configuration est déjà enregistrée, un mot de passe laissé vide est **conservé** : le mot de passe web quand l'accès reste protégé, celui du Wi-Fi tant que le réseau ne change pas, celui du MQTT tant que l'utilisateur ne change pas. Les mots de passe ne sont jamais renvoyés à la page (le formulaire affiche « (inchangé) »).
 
 **Wi-Fi injoignable (configuration présente)**
 
-- Si la connexion au Wi-Fi n'aboutit pas en 30 secondes (`WIFI_CONNECT_TIMEOUT_MS`), l'ESP ouvre le même point d'accès avec `startPortal(false)`. Cette fois, la page demande l'utilisateur et le mot de passe web, et affiche un message sur l'échec de la connexion.
+- Si la connexion au Wi-Fi n'aboutit pas en 30 secondes (`WIFI_CONNECT_TIMEOUT_MS`), l'ESP ouvre le même point d'accès avec `startPortal(false)`. Cette fois, la page demande l'utilisateur et le mot de passe web (si un compte a été défini), et affiche un message sur l'échec de la connexion.
 - Sans activité sur la page pendant 5 minutes (`PORTAL_RETRY_MS`), l'ESP redémarre pour retenter la connexion. Cela couvre une box encore en démarrage après une coupure de courant. Pendant que la page est ouverte, elle interroge l'ESP chaque minute pour éviter ce redémarrage en pleine saisie.
 - Le point d'accès n'est ouvert qu'au démarrage : une perte du Wi-Fi en cours de fonctionnement relève de la reconnexion automatique de l'ESP.
 
@@ -380,7 +382,7 @@ Quand l'ESP est connecté, l'onglet **Configuration** de la page principale prop
 
 **Revenir à la configuration initiale**
 
-Le bouton « Revenir à la configuration initiale » (route `POST /config/reset`, protégée par le mot de passe web) efface la configuration (`clearConfig()`) et redémarre : l'ESP rouvre le point d'accès « Micronova-Setup ». Le hostname et la hauteur de cuve sont conservés et pré-remplissent le formulaire. Si le mot de passe web est perdu, il faut reflasher l'ESP en effaçant toute la mémoire (option « Erase Flash : All Flash Contents » de l'IDE Arduino).
+Le bouton « Revenir à la configuration initiale » (route `POST /config/reset`, protégée par le mot de passe web, s'il y en a un) efface la configuration (`clearConfig()`) et redémarre : l'ESP rouvre le point d'accès « Micronova-Setup ». Le hostname et la hauteur de cuve sont conservés et pré-remplissent le formulaire. Si le mot de passe web est perdu, il faut reflasher l'ESP en effaçant toute la mémoire (option « Erase Flash : All Flash Contents » de l'IDE Arduino).
 
 ---
 
@@ -439,13 +441,14 @@ Elle comporte deux onglets :
 
 L'adresse `/config` sert la même page, ouverte sur l'onglet Configuration. En mode configuration (premier démarrage ou Wi-Fi injoignable), la page n'affiche que cet onglet.
 
-**Accès protégé** : les routes demandent un identifiant et un mot de passe (authentification HTTP basique, `checkAuth()`), à savoir l'utilisateur et le mot de passe web saisis dans la configuration. La route `/update` et l'OTA de l'IDE Arduino utilisent la même paire. Pendant la première configuration, aucun identifiant n'existe : seule la page de configuration est servie, sans mot de passe.
+**Accès protégé (facultatif)** : si un compte web est défini, les routes demandent un identifiant et un mot de passe (authentification HTTP basique, `checkAuth()`), à savoir l'utilisateur et le mot de passe web saisis dans la configuration. La route `/update` et l'OTA de l'IDE Arduino utilisent la même paire. Si l'utilisateur a décoché la case de protection, aucun mot de passe n'est enregistré et tout est en accès libre, y compris la modification de la configuration, la mise à jour du firmware et le bouton de retour à la configuration initiale. Pendant la première configuration, aucun identifiant n'existe : seule la page de configuration est servie, sans mot de passe.
 
 | Fonction             | Usage |
 |----------------------|-------|
 | `INDEX_HTML`         | Page complète (HTML, CSS, JavaScript) conservée en mémoire programme. |
 | `jsonEscape()`       | Échappe une chaîne pour l'insérer dans le JSON. |
-| `checkAuth()`        | Authentification HTTP basique avec les identifiants web de la configuration (aucun contrôle pendant la première configuration). |
+| `checkAuth()`        | Authentification HTTP basique avec les identifiants web de la configuration (aucun contrôle pendant la première configuration, ni si le compte web est désactivé). |
+| `webAuthEnabled()`   | Vrai si un mot de passe web est enregistré. Décide de `checkAuth()`, de la protection de `/update` et du mot de passe de l'OTA. |
 | `handleRoot()`       | Route `GET /` : envoie la page. |
 | `handleConfigPage()` | Route `GET /config` : envoie la même page, ouverte sur l'onglet Configuration. |
 | `handleStatus()`     | Route `GET /api/status` : renvoie tout l'état en JSON (hors mode configuration). |
@@ -462,7 +465,7 @@ L'adresse `/config` sert la même page, ouverte sur l'onglet Configuration. En m
 
 L'API `/api/status` renvoie : `temperature`, `consigne`, `state`, `distance`, `qte`, `hauteur`, `alignActive`, `alignRemain`, `alignDistance`, `alignStatus`, `ip`, `hostname`, `ssid`, `rssi`, `mac`, `mqtt`, `sensorOk`, `uptime`, `resetReason`, `heap`, `frag`, `version` et `build`.
 
-L'API `/api/config` renvoie : `first` (aucune configuration enregistrée), `portal` (mode configuration), `wifiFailed`, `ssid`, `hostname`, `hasWifiPass`, `mqttHost`, `mqttPort`, `mqttUser`, `hasMqttPass`, `pinRx`, `pinTx`, `pinEn`, `pinSda`, `pinScl`, `hauteur` et `webUser`.
+L'API `/api/config` renvoie : `first` (aucune configuration enregistrée), `portal` (mode configuration), `wifiFailed`, `ssid`, `hostname`, `hasWifiPass`, `mqttHost`, `mqttPort`, `mqttUser`, `hasMqttPass`, `pinRx`, `pinTx`, `pinEn`, `pinSda`, `pinScl`, `hauteur`, `webAuth` (compte web activé) et `webUser`. Le formulaire envoie de son côté `webAuth=1` quand la case est cochée ; sans cette valeur, les identifiants web sont effacés.
 
 L'onglet **Tableau de bord** est organisé en cartes :
 
@@ -475,7 +478,7 @@ L'onglet **Tableau de bord** est organisé en cartes :
 | Mise à jour du firmware (OTA)  | Choix du fichier `.bin` et envoi |
 | Maintenance                    | Redémarrage de l'ESP |
 
-L'onglet **Configuration** reprend les cartes Wi-Fi (réseau, mot de passe, hostname, recherche des réseaux), Serveur MQTT, Broches, Cuve à pellets, Accès à cette page et mises à jour (utilisateur, mot de passe et confirmation), puis une carte « Configuration initiale » pour tout effacer.
+L'onglet **Configuration** reprend les cartes Wi-Fi (réseau, mot de passe, hostname, recherche des réseaux), Serveur MQTT, Broches, Cuve à pellets, Accès à cette page et mises à jour (case « Protéger l'accès », puis utilisateur, mot de passe et confirmation, affichés seulement si elle est cochée), puis une carte « Configuration initiale » pour tout effacer.
 
 **Mise à jour par la page** : la page envoie le fichier `.bin` (Croquis > Exporter les binaires compilés) en `POST /update` (champ `update`), avec l'avancement en pourcentage. Une fois installé, l'ESP redémarre et la page se recharge au bout de 20 s. La mise à jour depuis l'IDE Arduino (`ArduinoOTA`, protégée par le mot de passe web) fonctionne toujours, et la page `GET /update` intégrée à la bibliothèque reste accessible.
 
@@ -488,6 +491,10 @@ L'onglet **Configuration** reprend les cartes Wi-Fi (réseau, mot de passe, host
 | Premier démarrage (point d'accès) | Repli si le Wi-Fi échoue |
 |---|---|
 | ![Premier démarrage](images/premier-demarrage.png) | ![Repli Wi-Fi](images/repli-wifi.png) |
+
+| Accès à la page sans compte (case décochée) |
+|---|
+| ![Sans compte](images/sans-compte.png) |
 
 
 ### Hostname
@@ -561,7 +568,7 @@ Toutes les entités embarquent la même description d'appareil (macro `device_in
   "identifiers": ["42396f39-80d2-493b-8e8e-31a70e700bc6"],
   "model": "Micronova Controller",
   "name": "Micronova Controller",
-  "sw_version": "0.13"
+  "sw_version": "0.14"
 }
 ```
 
@@ -637,7 +644,7 @@ L'entité **Adresse IP** (`homeassistant/sensor/Micronova/IP/config`) se comport
 
 ## 6. Annexe : points d'attention connus
 
-Ces points ressortent de la lecture du code. Ils ne sont pas corrigés dans la version 0.13.
+Ces points ressortent de la lecture du code. Ils ne sont pas corrigés dans la version 0.14.
 
 1. **Commande MQTT `H` inopérante.** Depuis la version 0.10, la hauteur de cuve est conservée en EEPROM et se règle depuis la page web. En revanche, la commande MQTT `H` (abonnement au topic `micronova/hauteur`) lit toujours la valeur sans l'affecter, et n'accepte que les messages de 3 caractères : la hauteur ne peut pas être modifiée par MQTT.
 2. **Plantage possible sur `P`.** Un message `P` suivi d'un caractère autre que 0 à 5 laisse un pointeur nul (`stovePW`) qui est ensuite utilisé pour l'écriture.
@@ -649,9 +656,9 @@ Ces points ressortent de la lecture du code. Ils ne sont pas corrigés dans la v
 8. **Détection lente des mesures aberrantes.** Une mesure n'ayant lieu que tous les 11 cycles, un capteur qui renvoie des valeurs aberrantes peut mettre jusqu'à 11 minutes à passer en défaut. Un capteur débranché est détecté en moins d'une minute.
 9. **Uptime limité à environ 49 jours.** L'uptime du heartbeat et de la page web vient de `millis()`, qui repasse à zéro après environ 49,7 jours.
 10. **Alignement et cycle de 60 s.** Pendant un alignement, le cycle périodique s'exécute normalement (interrogation du poêle, environ une demi-seconde bloquante) : le suivi en direct marque alors une brève pause.
-11. **Identifiants partagés, sans chiffrement.** La page web, la mise à jour par navigateur et l'OTA de l'IDE utilisent les mêmes identifiants web, saisis dans la configuration. L'authentification HTTP basique circule en clair sur le réseau local (pas de HTTPS), et les mots de passe (Wi-Fi, MQTT, web) sont stockés en clair dans la flash de l'ESP.
+11. **Identifiants partagés, facultatifs, sans chiffrement.** La page web, la mise à jour par navigateur et l'OTA de l'IDE utilisent les mêmes identifiants web, saisis dans la configuration, et ils sont facultatifs : si le compte est désactivé, toute personne présente sur le réseau local peut modifier la configuration et mettre à jour le firmware. L'authentification HTTP basique circule en clair sur le réseau local (pas de HTTPS), et les mots de passe (Wi-Fi, MQTT, web) sont stockés en clair dans la flash de l'ESP.
 12. **Point d'accès ouvert pendant la première configuration.** Tant que l'ESP n'est pas configuré, toute personne à portée peut se connecter à « Micronova-Setup » et saisir une configuration. On peut le protéger en renseignant `AP_PASS` (8 caractères minimum) dans le code.
-13. **Mot de passe web perdu.** Il n'existe pas de bouton physique de remise à zéro : il faut reflasher l'ESP en effaçant toute la mémoire (option « Erase Flash : All Flash Contents »).
+13. **Mot de passe web perdu** (si un compte est défini). Il n'existe pas de bouton physique de remise à zéro : il faut reflasher l'ESP en effaçant toute la mémoire (option « Erase Flash : All Flash Contents »).
 14. **Wi-Fi perdu en cours de fonctionnement.** Le point d'accès de configuration n'est ouvert qu'au démarrage. Après une coupure du Wi-Fi, l'ESP compte sur sa reconnexion automatique et ne rouvre pas le portail.
 15. **Préfixe des topics MQTT fixe.** Le préfixe `micronova` et l'identifiant client `ESPClient` restent définis dans le code : deux ESP sur le même broker se gêneraient.
 
@@ -668,6 +675,7 @@ Ces points ressortent de la lecture du code. Ils ne sont pas corrigés dans la v
 | 0.11    | Nouvelle interface web (page statique et API JSON `/api/status`, actions sans rechargement), mise à jour du firmware depuis la page avec progression, accès protégé par `ota_user` / `ota_pass`, alignement intégré à la page principale |
 | 0.12    | Configuration saisie sur une page web et conservée en EEPROM : Wi-Fi, serveur MQTT, broches, hauteur de cuve, identifiants web. Point d'accès « Micronova-Setup » au premier démarrage et en repli si le Wi-Fi échoue. Suppression de `secrets.h` |
 | 0.13    | La configuration devient un onglet de la page principale (onglets Tableau de bord et Configuration), avec retour à la configuration initiale |
+| 0.14    | Compte d'accès à la page web facultatif : case à cocher à la première configuration et dans l'onglet Configuration ; sans compte, la page, `/update` et l'OTA sont en accès libre |
 
 Notes de migration :
 
@@ -675,4 +683,5 @@ Notes de migration :
 - Au premier passage à une version 0.10 ou supérieure, la hauteur de cuve est à ressaisir une fois (500 mm tant qu'aucune valeur n'est enregistrée).
 - À partir de la version 0.12, `secrets.h` et `secrets.example.h` ne sont plus utilisés et peuvent être supprimés du projet. Les identifiants de la page web et de l'OTA (`ota_user` / `ota_pass`) sont maintenant saisis dans la configuration.
 - Au premier démarrage d'une version 0.12 ou supérieure, l'ESP n'a pas de configuration : il ouvre le point d'accès « Micronova-Setup », y compris après une mise à jour OTA depuis une version précédente. Le hostname et la hauteur de cuve déjà enregistrés pré-remplissent le formulaire ; le Wi-Fi, le MQTT et le mot de passe web sont à saisir.
+- À partir de la version 0.14, le compte web est facultatif. Une configuration enregistrée en 0.13 est conservée avec son compte, la case étant alors cochée ; pour passer en accès libre, décochez-la dans l'onglet Configuration.
 - La route `POST /hostname` et le formulaire du hostname du tableau de bord n'existent plus : le hostname se modifie dans l'onglet Configuration.

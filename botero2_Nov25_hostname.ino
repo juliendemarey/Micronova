@@ -14,7 +14,7 @@
 //configuration (point d'acces "Micronova-Setup" au premier demarrage) et conserves en EEPROM.
 
 //Version du firmware (a incrementer a chaque nouvelle version)
-    #define FW_VERSION "0.13"
+    #define FW_VERSION "0.14"
 
 
 //MQTT Variables
@@ -85,7 +85,7 @@ bool hauteur_set = false;        // indique si modifiée via web
     String cfgSsid, cfgPass;
     String cfgMqttHost, cfgMqttUser, cfgMqttPass;
     uint16_t cfgMqttPort = DEFAULT_MQTT_PORT;
-    String cfgWebUser = "admin", cfgWebPass;     // identifiants de la page web, de /update et de l'OTA
+    String cfgWebUser = "admin", cfgWebPass;     // identifiants (facultatifs) de la page web, de /update et de l'OTA ; mot de passe vide = acces libre
     bool cfgConfigured = false;                  // une configuration complete est stockee en EEPROM
 
 //Mode configuration (point d'acces + page /config, sans MQTT ni dialogue avec le poele)
@@ -206,6 +206,7 @@ void loadConfig()
     cfgMqttPass = sc.mqttPass;
     cfgWebUser = sc.webUser;
     cfgWebPass = sc.webPass;
+    if (cfgWebUser.length() == 0) cfgWebUser = "admin";   // valeur proposee dans le formulaire
     if (sc.mqttPort > 0) cfgMqttPort = sc.mqttPort;
 
     if (isValidPin(sc.pinRx) && isValidPin(sc.pinTx) && isValidPin(sc.pinEnable) && isValidPin(sc.pinSda) && isValidPin(sc.pinScl)
@@ -218,7 +219,7 @@ void loadConfig()
         pinScl = sc.pinScl;
     }
 
-    cfgConfigured = cfgSsid.length() > 0 && cfgMqttHost.length() > 0 && cfgWebUser.length() > 0 && cfgWebPass.length() > 0;
+    cfgConfigured = cfgSsid.length() > 0 && cfgMqttHost.length() > 0;   // le compte web est facultatif
 }
 
 //Enregistre la configuration en EEPROM (les variables cfg* ne sont pas modifiees : l'ESP redemarre ensuite)
@@ -1297,6 +1298,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   .item b { font-size:1.05rem; word-break:break-all; }
   .big b { font-size:1.8rem; }
   .hint { color:var(--mut); font-size:.85rem; margin:0 0 12px; }
+  .chk { display:flex; align-items:center; gap:8px; margin:6px 0 10px; color:var(--txt); font-size:.95rem; }
+  .chk input { width:auto; }
   label { display:block; margin:10px 0 4px; font-size:.85rem; color:var(--mut); }
   input, select { width:100%; padding:10px; border:1px solid var(--bd); border-radius:8px; background:var(--bg); color:var(--txt); font-size:1rem; }
   button { padding:10px 16px; border:0; border-radius:8px; font-size:1rem; cursor:pointer; background:var(--acc); color:#fff; }
@@ -1455,9 +1458,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 
     <div class="card">
       <h2>Accès à cette page et mises à jour</h2>
-      <p class="hint">Ces identifiants protègent la page web, la mise à jour par navigateur (/update) et la mise à jour depuis l'IDE Arduino.</p>
-      <div class="two">
-        <div><label for="c_webUser">Utilisateur</label><input id="c_webUser" name="webUser" maxlength="32" required autocomplete="off"></div>
+      <label class="chk"><input type="checkbox" id="c_webAuth" name="webAuth" value="1" checked> Protéger l'accès par un identifiant et un mot de passe</label>
+      <p class="hint" id="c_authhint">Ces identifiants protègent la page web, la mise à jour par navigateur (/update) et la mise à jour depuis l'IDE Arduino.</p>
+      <div class="two" id="c_authfields">
+        <div><label for="c_webUser">Utilisateur</label><input id="c_webUser" name="webUser" maxlength="32" autocomplete="off"></div>
         <div></div>
         <div><label for="c_webPass">Mot de passe (6 caractères minimum)</label><input id="c_webPass" name="webPass" type="password" maxlength="63" autocomplete="new-password"></div>
         <div><label for="c_webPass2">Confirmer le mot de passe</label><input id="c_webPass2" name="webPass2" type="password" maxlength="63" autocomplete="new-password"></div>
@@ -1594,6 +1598,7 @@ $('reboot').onclick = async () => {
 const PINS = [[5,'D1'],[4,'D2'],[0,'D3'],[2,'D4'],[14,'D5'],[12,'D6'],[13,'D7'],[15,'D8']];
 const PIN_FIELDS = ['c_pinRx','c_pinTx','c_pinEn','c_pinSda','c_pinScl'];
 let firstSetup = true;   // aucune configuration stockee : seul l'onglet Configuration est proposé
+let hadWebPass = false;  // un mot de passe web est deja enregistre (laisse vide = conserve)
 let portal = false;      // point d'accès de configuration : pas de tableau de bord (poêle et MQTT inactifs)
 
 PIN_FIELDS.forEach(id => {
@@ -1608,6 +1613,19 @@ function showTab(name) {
 }
 $('tabdash').onclick = () => showTab('dash');
 $('tabcfg').onclick  = () => showTab('cfg');
+
+function updateAuthUi() {
+  const on = $('c_webAuth').checked;
+  $('c_authfields').style.display = on ? '' : 'none';
+  $('c_authhint').textContent = on
+    ? 'Ces identifiants protègent la page web, la mise à jour par navigateur (/update) et la mise à jour depuis l\'IDE Arduino.'
+    : 'Sans identifiant, toute personne présente sur votre réseau peut modifier la configuration et mettre à jour le firmware.';
+  const needPass = on && !hadWebPass;
+  $('c_webUser').required = on;
+  $('c_webPass').required = needPass;
+  $('c_webPass2').required = needPass;
+}
+$('c_webAuth').onchange = updateAuthUi;
 
 function show(id, text, bad) {
   $(id).textContent = text;
@@ -1639,12 +1657,13 @@ async function loadConfig() {
     $('c_pass').value = '';  $('c_mqttPass').value = '';  $('c_webPass').value = '';  $('c_webPass2').value = '';
     $('c_pass').placeholder = c.hasWifiPass ? '(inchangé)' : '';
     $('c_mqttPass').placeholder = c.hasMqttPass ? '(inchangé)' : '';
-    $('c_webPass').placeholder = firstSetup ? '' : '(inchangé)';
-    $('c_webPass').required = firstSetup;
-    $('c_webPass2').required = firstSetup;
+    hadWebPass = !firstSetup && c.webAuth;
+    $('c_webAuth').checked = firstSetup ? true : c.webAuth;   // protege par defaut a la premiere configuration
+    $('c_webPass').placeholder = hadWebPass ? '(inchangé)' : '';
+    updateAuthUi();
     $('c_resetcard').style.display = firstSetup ? 'none' : '';
     if (firstSetup) {
-      $('c_intro').textContent = 'Première configuration : renseignez le Wi-Fi, le serveur MQTT, les broches et la hauteur de la cuve. Après l\'enregistrement, l\'ESP redémarre et utilise ces valeurs.';
+      $('c_intro').textContent = 'Première configuration : renseignez le Wi-Fi, le serveur MQTT, les broches et la hauteur de la cuve (le compte d\'accès à la page est facultatif). Après l\'enregistrement, l\'ESP redémarre et utilise ces valeurs.';
     } else if (portal) {
       $('c_intro').textContent = 'L\'ESP n\'a pas réussi à se connecter au Wi-Fi « ' + c.ssid + ' ». Vérifiez les réglages ci-dessous, puis enregistrez.';
     } else {
@@ -1665,8 +1684,10 @@ $('c_cancel').onclick = () => { show('c_msg', ''); loadConfig(); };
 
 $('c_cfg').onsubmit = async ev => {
   ev.preventDefault();
-  if ($('c_webPass').value !== $('c_webPass2').value) { show('c_msg', 'Les deux mots de passe web ne sont pas identiques.', true); return; }
+  const auth = $('c_webAuth').checked;
+  if (auth && $('c_webPass').value !== $('c_webPass2').value) { show('c_msg', 'Les deux mots de passe web ne sont pas identiques.', true); return; }
   if (new Set(PIN_FIELDS.map(id => $(id).value)).size !== PIN_FIELDS.length) { show('c_msg', 'Chaque fonction doit utiliser une broche différente.', true); return; }
+  if (!auth && !confirm('Aucun identifiant ne protégera la page, /update et l\'OTA : toute personne présente sur votre réseau pourra modifier la configuration et mettre à jour le firmware. Continuer ?')) return;
   const body = new URLSearchParams(new FormData($('c_cfg')));
   body.delete('webPass2');
   $('c_save').disabled = true;
@@ -1720,12 +1741,19 @@ String jsonEscape(const String &in)
     return out;
 }
 
-//Authentification HTTP basique : identifiants saisis a la configuration (les memes pour la page, /update et l'OTA).
+//Le compte web est facultatif : sans mot de passe enregistre, la page, /update et l'OTA sont en acces libre.
+bool webAuthEnabled()
+{
+    return cfgWebPass.length() > 0;
+}
+
+//Authentification HTTP basique : identifiants saisis a la configuration (les memes pour la page, /update et l'OTA),
+//sauf si l'utilisateur a choisi de ne pas en definir (acces libre).
 //Pendant la premiere configuration, aucun identifiant n'existe encore : seule la page de configuration est servie, sans mot de passe.
 bool checkAuth()
 {
     lastWebActivity = millis();
-    if (portalFirstSetup) return true;
+    if (portalFirstSetup || !webAuthEnabled()) return true;
     if (!webServer.authenticate(cfgWebUser.c_str(), cfgWebPass.c_str()))
     {
         webServer.requestAuthentication();
@@ -1919,6 +1947,7 @@ void handleConfigGet()
     j += ",\"pinSda\":" + String(pinSda);
     j += ",\"pinScl\":" + String(pinScl);
     j += ",\"hauteur\":" + String(hauteur_cuve);
+    j += ",\"webAuth\":" + String(webAuthEnabled() ? "true" : "false");
     j += ",\"webUser\":\"" + jsonEscape(cfgWebUser) + "\"";
     j += "}";
 
@@ -1945,15 +1974,21 @@ void handleConfigSave()
     int pSda = webServer.arg("pinSda").toInt();
     int pScl = webServer.arg("pinScl").toInt();
     int hauteur = webServer.arg("hauteur").toInt();
+    bool webAuth = webServer.arg("webAuth") == "1";   // case cochee : compte web active (facultatif)
     String wUser = webServer.arg("webUser");    wUser.trim();
     String wPass = webServer.arg("webPass");
+    if (!webAuth)
+    {
+        wUser = "";   // acces libre : aucun identifiant enregistre
+        wPass = "";
+    }
 
     //Champ de mot de passe laisse vide : on garde l'ancien (tant que le reseau / l'utilisateur ne change pas)
     if (cfgConfigured)
     {
         if (pass.length() == 0 && ssid == cfgSsid) pass = cfgPass;
         if (mPass.length() == 0 && mUser == cfgMqttUser) mPass = cfgMqttPass;
-        if (wPass.length() == 0) wPass = cfgWebPass;
+        if (webAuth && wPass.length() == 0) wPass = cfgWebPass;
     }
 
     String err = "";
@@ -1966,8 +2001,8 @@ void handleConfigSave()
     else if (!isValidPin(pRx) || !isValidPin(pTx) || !isValidPin(pEn) || !isValidPin(pSda) || !isValidPin(pScl)) err = "Broche invalide.";
     else if (!pinsAreDistinct(pRx, pTx, pEn, pSda, pScl)) err = "Chaque fonction doit utiliser une broche différente.";
     else if (hauteur < 101 || hauteur > 1999) err = "Hauteur de cuve invalide (101 à 1999 mm).";
-    else if (wUser.length() < 1 || wUser.length() > 32 || wUser.indexOf(':') >= 0) err = "Utilisateur web invalide (1 à 32 caractères, sans « : »).";
-    else if (wPass.length() < 6 || wPass.length() > 63) err = "Mot de passe web invalide (6 à 63 caractères).";
+    else if (webAuth && (wUser.length() < 1 || wUser.length() > 32 || wUser.indexOf(':') >= 0)) err = "Utilisateur web invalide (1 à 32 caractères, sans « : »).";
+    else if (webAuth && (wPass.length() < 6 || wPass.length() > 63)) err = "Mot de passe web invalide (6 à 63 caractères).";
 
     if (err.length() > 0)
     {
@@ -2015,7 +2050,8 @@ void setupWebServer()
         webServer.on("/set", HTTP_POST, handleSet);
         webServer.on("/reboot", HTTP_POST, handleReboot);
         webServer.on("/align/start", HTTP_POST, handleAlignStart);
-        httpUpdater.setup(&webServer, "/update", cfgWebUser.c_str(), cfgWebPass.c_str());
+        if (webAuthEnabled()) httpUpdater.setup(&webServer, "/update", cfgWebUser.c_str(), cfgWebPass.c_str());
+        else httpUpdater.setup(&webServer, "/update");
     }
     webServer.begin();
 }
@@ -2111,7 +2147,7 @@ void setup()
 
     // OTA depuis l'IDE Arduino / PlatformIO
     ArduinoOTA.setHostname(espHostname.c_str());
-    ArduinoOTA.setPassword(cfgWebPass.c_str());
+    if (webAuthEnabled()) ArduinoOTA.setPassword(cfgWebPass.c_str());
     ArduinoOTA.onStart([]() { Write_Log(client, "OTA : debut de la mise a jour"); });
     ArduinoOTA.onEnd([]() { Write_Log(client, "OTA : termine, redemarrage"); });
     ArduinoOTA.onError([](ota_error_t error) { Write_Log(client, "OTA : erreur " + String((int)error)); });

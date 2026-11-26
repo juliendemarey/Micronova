@@ -2,7 +2,7 @@
 
 > ESP8266 firmware that bridges a Micronova pellet stove and Home Assistant over MQTT: stove control, pellet hopper level measurement, MQTT autodiscovery, web configuration page and OTA updates.
 
-This document describes the firmware **version 0.13** (`botero2_Nov25_hostname.ino`).
+This document describes the firmware **version 0.14** (`botero2_Nov25_hostname.ino`).
 
 ## Table of contents
 
@@ -28,7 +28,7 @@ This firmware turns an ESP8266 into a gateway between a **pellet stove fitted wi
 - help position that sensor in the hopper (alignment mode: infrared emitted continuously, distance shown live);
 - tell HA that it is alive and that the pellet sensor works (MQTT heartbeat), so that a failure can be detected, and report its IP address;
 - declare all its sensors and controls to HA automatically (MQTT discovery);
-- be configured without touching the code: on first start, a web page (Wi-Fi access point "Micronova-Setup") lets you enter the Wi-Fi, the MQTT server, the pins, the hopper height and the web credentials, then the ESP restarts with these values;
+- be configured without touching the code: on first start, a web page (Wi-Fi access point "Micronova-Setup") lets you enter the Wi-Fi, the MQTT server, the pins, the hopper height and, optionally, an account to access the web page, then the ESP restarts with these values;
 - be changed later from the same interface (Configuration tab) and updated without a cable (web page, OTA).
 
 ### Architecture
@@ -317,11 +317,13 @@ The EEPROM (432 bytes reserved) keeps the hostname, the hopper height and, since
 | 40       | Marker `0xB7` (a hopper height is stored)                            |
 | 41       | Hopper height in mm, low byte                                        |
 | 42       | Hopper height in mm, high byte                                       |
-| 64 to 431 | Configuration (`StoredCfg` structure, marker `0xC0F10012`): Wi-Fi (network, password), MQTT server (address, port, user, password), the five pins (GPIO numbers), web user name and password |
+| 64 to 431 | Configuration (`StoredCfg` structure, marker `0xC0F10012`): Wi-Fi (network, password), MQTT server (address, port, user, password), the five pins (GPIO numbers), web user name and password (optional: empty when access to the page is open) |
 
 Without a valid marker, or if the content is not a valid hostname, the default value `micronova` is used. In the same way, without a valid `0xB7` marker, or if the height is not between 101 and 1999 mm, the default value of 500 mm is kept. The height is only written when it has changed, to spare the flash.
 
-Without the `0xC0F10012` marker, or if the Wi-Fi, the MQTT address, the web user or its password are missing, the ESP considers it is not configured and opens the configuration portal. An invalid or duplicated pin in the structure is ignored: the original pins stay in use.
+Without the `0xC0F10012` marker, or if the Wi-Fi or the MQTT address are missing, the ESP considers it is not configured and opens the configuration portal. An invalid or duplicated pin in the structure is ignored: the original pins stay in use.
+
+The web account is **optional**: with no web password stored (`webAuthEnabled()` false), the page, `/update` and OTA are open. Version 0.13 configurations, which always contain an account, stay valid as they are.
 
 The passwords are stored **in clear text** in the ESP flash.
 
@@ -339,14 +341,14 @@ Since version 0.9, the web page offers an alignment mode to position the VL53L0X
 
 ### 3.7 First configuration and later changes
 
-Since version 0.12, no setting is written in the code: the Wi-Fi, the MQTT server, the pins, the hopper height and the web credentials are entered on the configuration page and kept in EEPROM (see 3.5).
+Since version 0.12, no setting is written in the code: the Wi-Fi, the MQTT server, the pins, the hopper height and the web account (optional) are entered on the configuration page and kept in EEPROM (see 3.5).
 
 **First start (no configuration stored)**
 
 1. `setup()` finds no configuration (`cfgConfigured` is false) and calls `startPortal(true)`.
 2. The ESP scans for Wi-Fi networks in range (list kept in cache), then opens the **`Micronova-Setup`** access point, open by default (constants `AP_SSID` and `AP_PASS`). A DNS server sends any address to the ESP (captive portal): on a phone, the page opens by itself, otherwise at `http://192.168.4.1`.
-3. The web server only serves the page, limited to the Configuration tab, and the configuration routes, **without a password** since none exists yet. The stove, the sensor, MQTT and OTA are not started, and the pins are not touched.
-4. The form is pre-filled: original pins, MQTT port 1883, hopper height 500 mm (or the value already stored), the stored hostname or `micronova`, web user `admin`.
+3. The web server only serves the page, limited to the Configuration tab, and the configuration routes, **without a password** since none exists yet (the web account is chosen in this same form). The stove, the sensor, MQTT and OTA are not started, and the pins are not touched.
+4. The form is pre-filled: original pins, MQTT port 1883, hopper height 500 mm (or the value already stored), the stored hostname or `micronova`, web user `admin`. The "Protéger l'accès par un identifiant et un mot de passe" (protect access with a user name and password) checkbox is **ticked by default**; when unticked, the account fields disappear and a confirmation is asked on saving.
 5. `POST /api/config` validates the values, stores them, then restarts the ESP after half a second. On the next start, `loadConfig()` reads these values back and the ESP runs normally.
 
 **Validation rules**
@@ -361,14 +363,14 @@ Since version 0.12, no setting is written in the code: the Wi-Fi, the MQTT serve
 | MQTT user, password             | At most 32 and 63 characters. Empty user: connection without authentication |
 | Pins                            | D1 to D8 (GPIO 0, 2, 4, 5, 12, 13, 14, 15), five different pins |
 | Hopper height                   | 101 to 1999 mm |
-| Web user                        | 1 to 32 characters, no ":" |
-| Web password                    | 6 to 63 characters |
+| Web user                        | Only if access is protected: 1 to 32 characters, no ":" |
+| Web password                    | Only if access is protected: 6 to 63 characters |
 
-When a configuration is already stored, an empty password field is **kept**: the web password always, the Wi-Fi one as long as the network does not change, the MQTT one as long as the user does not change. Passwords are never sent back to the page (the form shows "(inchangé)", meaning unchanged).
+When a configuration is already stored, an empty password field is **kept**: the web password while access stays protected, the Wi-Fi one as long as the network does not change, the MQTT one as long as the user does not change. Passwords are never sent back to the page (the form shows "(inchangé)", meaning unchanged).
 
 **Wi-Fi unreachable (configuration present)**
 
-- If the Wi-Fi connection does not succeed within 30 seconds (`WIFI_CONNECT_TIMEOUT_MS`), the ESP opens the same access point with `startPortal(false)`. This time, the page asks for the web user name and password, and shows a message about the failed connection.
+- If the Wi-Fi connection does not succeed within 30 seconds (`WIFI_CONNECT_TIMEOUT_MS`), the ESP opens the same access point with `startPortal(false)`. This time, the page asks for the web user name and password (if an account was defined), and shows a message about the failed connection.
 - With no activity on the page for 5 minutes (`PORTAL_RETRY_MS`), the ESP restarts to try the connection again. This covers a router still booting after a power cut. While the page is open, it queries the ESP every minute to avoid that restart in the middle of typing.
 - The access point is only opened at startup: a Wi-Fi loss during operation is left to the ESP's automatic reconnection.
 
@@ -382,7 +384,7 @@ When the ESP is connected, the **Configuration** tab of the main page offers the
 
 **Going back to the initial configuration**
 
-The "Revenir à la configuration initiale" button (route `POST /config/reset`, protected by the web password) erases the configuration (`clearConfig()`) and restarts: the ESP reopens the "Micronova-Setup" access point. The hostname and the hopper height are kept and pre-fill the form. If the web password is lost, the ESP has to be reflashed with a full flash erase (the "Erase Flash: All Flash Contents" option of the Arduino IDE).
+The "Revenir à la configuration initiale" button (route `POST /config/reset`, protected by the web password, if there is one) erases the configuration (`clearConfig()`) and restarts: the ESP reopens the "Micronova-Setup" access point. The hostname and the hopper height are kept and pre-fill the form. If the web password is lost, the ESP has to be reflashed with a full flash erase (the "Erase Flash: All Flash Contents" option of the Arduino IDE).
 
 ---
 
@@ -441,13 +443,14 @@ It has two tabs:
 
 The `/config` address serves the same page, opened on the Configuration tab. In configuration mode (first start or Wi-Fi unreachable), the page only shows that tab.
 
-**Protected access**: the routes ask for a user name and a password (HTTP basic authentication, `checkAuth()`), which are the web user and password entered in the configuration. The `/update` route and the Arduino IDE OTA use the same pair. During the first configuration no credentials exist: only the configuration page is served, without a password.
+**Protected access (optional)**: if a web account is defined, the routes ask for a user name and a password (HTTP basic authentication, `checkAuth()`), which are the web user and password entered in the configuration. The `/update` route and the Arduino IDE OTA use the same pair. If the user has unticked the protection checkbox, no password is stored and everything is open, including changing the configuration, updating the firmware and the button going back to the initial configuration. During the first configuration no credentials exist: only the configuration page is served, without a password.
 
 | Function             | Usage |
 |----------------------|-------|
 | `INDEX_HTML`         | The complete page (HTML, CSS, JavaScript), kept in program memory. |
 | `jsonEscape()`       | Escapes a string so it can be put in the JSON. |
-| `checkAuth()`        | HTTP basic authentication with the web credentials of the configuration (no check during the first configuration). |
+| `checkAuth()`        | HTTP basic authentication with the web credentials of the configuration (no check during the first configuration, nor if the web account is disabled). |
+| `webAuthEnabled()`   | True if a web password is stored. Drives `checkAuth()`, the protection of `/update` and the OTA password. |
 | `handleRoot()`       | Route `GET /`: sends the page. |
 | `handleConfigPage()` | Route `GET /config`: sends the same page, opened on the Configuration tab. |
 | `handleStatus()`     | Route `GET /api/status`: returns the whole state as JSON (not in configuration mode). |
@@ -464,7 +467,7 @@ The `/config` address serves the same page, opened on the Configuration tab. In 
 
 The `/api/status` API returns: `temperature`, `consigne`, `state`, `distance`, `qte`, `hauteur`, `alignActive`, `alignRemain`, `alignDistance`, `alignStatus`, `ip`, `hostname`, `ssid`, `rssi`, `mac`, `mqtt`, `sensorOk`, `uptime`, `resetReason`, `heap`, `frag`, `version` and `build`.
 
-The `/api/config` API returns: `first` (no configuration stored), `portal` (configuration mode), `wifiFailed`, `ssid`, `hostname`, `hasWifiPass`, `mqttHost`, `mqttPort`, `mqttUser`, `hasMqttPass`, `pinRx`, `pinTx`, `pinEn`, `pinSda`, `pinScl`, `hauteur` and `webUser`.
+The `/api/config` API returns: `first` (no configuration stored), `portal` (configuration mode), `wifiFailed`, `ssid`, `hostname`, `hasWifiPass`, `mqttHost`, `mqttPort`, `mqttUser`, `hasMqttPass`, `pinRx`, `pinTx`, `pinEn`, `pinSda`, `pinScl`, `hauteur`, `webAuth` (web account enabled) and `webUser`. The form sends `webAuth=1` when the checkbox is ticked; without it, the web credentials are erased.
 
 The **dashboard** tab is organized in cards:
 
@@ -477,7 +480,7 @@ The **dashboard** tab is organized in cards:
 | Mise à jour du firmware (OTA)  | `.bin` file choice and upload |
 | Maintenance                    | ESP restart |
 
-The **Configuration** tab has the cards Wi-Fi (network, password, hostname, network search), Serveur MQTT, Broches (pins), Cuve à pellets (hopper), Accès à cette page et mises à jour (user, password and confirmation), then a "Configuration initiale" card to erase everything.
+The **Configuration** tab has the cards Wi-Fi (network, password, hostname, network search), Serveur MQTT, Broches (pins), Cuve à pellets (hopper), Accès à cette page et mises à jour (a "Protéger l'accès" checkbox, then user, password and confirmation, shown only when it is ticked), then a "Configuration initiale" card to erase everything.
 
 **Update from the page**: the page sends the `.bin` file (Sketch > Export compiled binary) with `POST /update` (field `update`), showing the progress in percent. Once installed, the ESP restarts and the page reloads after 20 s. Updating from the Arduino IDE (`ArduinoOTA`, protected by the web password) still works, and the `GET /update` page built into the library remains available.
 
@@ -490,6 +493,10 @@ The **Configuration** tab has the cards Wi-Fi (network, password, hostname, netw
 | First start (access point) | Wi-Fi fallback |
 |---|---|
 | ![First start](images/premier-demarrage.png) | ![Wi-Fi fallback](images/repli-wifi.png) |
+
+| Page access without an account (checkbox unticked) |
+|---|
+| ![No account](images/sans-compte.png) |
 
 
 ### Hostname
@@ -563,7 +570,7 @@ Every entity carries the same device description (the `device_information` macro
   "identifiers": ["42396f39-80d2-493b-8e8e-31a70e700bc6"],
   "model": "Micronova Controller",
   "name": "Micronova Controller",
-  "sw_version": "0.13"
+  "sw_version": "0.14"
 }
 ```
 
@@ -639,7 +646,7 @@ The **Adresse IP** entity (`homeassistant/sensor/Micronova/IP/config`) behaves d
 
 ## 6. Appendix: known issues
 
-These points come from reading the code. They are not fixed in version 0.13.
+These points come from reading the code. They are not fixed in version 0.14.
 
 1. **MQTT `H` command does nothing.** Since version 0.10, the hopper height is kept in EEPROM and set from the web page. However, the MQTT `H` command (subscription to the `micronova/hauteur` topic) still reads the value without assigning it, and only accepts 3-character messages: the height cannot be changed over MQTT.
 2. **Possible crash on `P`.** A `P` message followed by a character other than 0 to 5 leaves a null pointer (`stovePW`) that is then used for the write.
@@ -651,9 +658,9 @@ These points come from reading the code. They are not fixed in version 0.13.
 8. **Slow detection of out-of-range readings.** Since a measurement is only taken every 11 cycles, a sensor returning out-of-range values can take up to 11 minutes to be flagged as faulty. A disconnected sensor is detected in under a minute.
 9. **Uptime limited to about 49 days.** The uptime in the heartbeat and on the web page comes from `millis()`, which wraps to zero after about 49.7 days.
 10. **Alignment and the 60 s cycle.** During an alignment, the periodic cycle runs as usual (stove polling, about half a second of blocking): the live view briefly pauses.
-11. **Shared credentials, no encryption.** The web page, browser update and IDE OTA use the same web credentials, entered in the configuration. HTTP basic authentication travels in clear text on the local network (no HTTPS), and the passwords (Wi-Fi, MQTT, web) are stored in clear text in the ESP flash.
+11. **Shared credentials, optional, no encryption.** The web page, browser update and IDE OTA use the same web credentials, entered in the configuration, and they are optional: if the account is disabled, anyone on the local network can change the configuration and update the firmware. HTTP basic authentication travels in clear text on the local network (no HTTPS), and the passwords (Wi-Fi, MQTT, web) are stored in clear text in the ESP flash.
 12. **Open access point during the first configuration.** As long as the ESP is not configured, anyone in range can connect to "Micronova-Setup" and enter a configuration. It can be protected by setting `AP_PASS` (8 characters minimum) in the code.
-13. **Lost web password.** There is no physical reset button: the ESP has to be reflashed with a full flash erase (the "Erase Flash: All Flash Contents" option).
+13. **Lost web password** (if an account is defined). There is no physical reset button: the ESP has to be reflashed with a full flash erase (the "Erase Flash: All Flash Contents" option).
 14. **Wi-Fi lost during operation.** The configuration access point is only opened at startup. After a Wi-Fi outage, the ESP relies on its automatic reconnection and does not reopen the portal.
 15. **Fixed MQTT topic prefix.** The `micronova` prefix and the `ESPClient` client id are still defined in the code: two ESPs on the same broker would interfere.
 
@@ -670,6 +677,7 @@ These points come from reading the code. They are not fixed in version 0.13.
 | 0.11    | New web interface (static page and JSON API `/api/status`, actions without reload), firmware update from the page with progress, access protected by `ota_user` / `ota_pass`, alignment built into the main page |
 | 0.12    | Configuration entered on a web page and kept in EEPROM: Wi-Fi, MQTT server, pins, hopper height, web credentials. "Micronova-Setup" access point on first start and as a fallback if the Wi-Fi fails. `secrets.h` removed |
 | 0.13    | The configuration becomes a tab of the main page (Tableau de bord and Configuration tabs), with a way back to the initial configuration |
+| 0.14    | Optional web page account: checkbox on the first configuration and in the Configuration tab; with no account, the page, `/update` and OTA are open |
 
 Migration notes:
 
@@ -677,4 +685,5 @@ Migration notes:
 - When first moving to version 0.10 or later, the hopper height has to be entered once again (500 mm until a value is stored).
 - From version 0.12 on, `secrets.h` and `secrets.example.h` are no longer used and can be removed from the project. The web page and OTA credentials (`ota_user` / `ota_pass`) are now entered in the configuration.
 - On the first start of a version 0.12 or later, the ESP has no configuration: it opens the "Micronova-Setup" access point, including after an OTA update from an earlier version. The hostname and hopper height already stored pre-fill the form; the Wi-Fi, MQTT and web password have to be entered.
+- From version 0.14, the web account is optional. A configuration saved with 0.13 keeps its account, with the checkbox ticked; to switch to open access, untick it in the Configuration tab.
 - The `POST /hostname` route and the hostname form of the dashboard no longer exist: the hostname is changed in the Configuration tab.
